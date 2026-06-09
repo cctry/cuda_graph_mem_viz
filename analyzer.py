@@ -479,6 +479,129 @@ non-reusable (approx): <b>{sc.get('S3_non_reusable_approx', 0)}</b>
 </body></html>"""
 
 
+# --------------------------------------------------------------------------- #
+# Perfetto / Chrome trace export (load at ui.perfetto.dev or any Perfetto).
+# --------------------------------------------------------------------------- #
+
+# (flag key, track label, Perfetto reserved color name, pid lane).
+_PERFETTO_TRACKS = [
+    ("S2_pool_bloating", "pool-bloating (huge)", "terrible", 1),
+    ("S3_non_reusable", "non-reusable bridge", "olive", 2),
+    ("S1_lingering", "lingering (long-lived)", "bad", 3),
+    (None, "normal", "grey", 4),
+]
+_PERFETTO_COUNTER_PID = 9
+
+
+def to_perfetto(result: dict) -> dict:
+    """Chrome Trace Event JSON for Perfetto (https://ui.perfetto.dev).
+
+    Each allocation is a nestable-async slice (ph b/e) on a per-signature track,
+    coloured by signature; the x-axis is the capture-order event ordinal (NOT
+    wall-clock, consistent with AC-8). A counter track plots graph-pool live
+    bytes over capture order. This is a standard Chrome trace, so it loads in any
+    Perfetto instance and supports zoom / search / filter over all allocations.
+    """
+    cname_by_pid = {pid: cname for _, _, cname, pid in _PERFETTO_TRACKS}
+    normal_pid = _PERFETTO_TRACKS[-1][3]
+
+    def categorize(flags: List[str]) -> int:
+        for key, _lbl, _c, pid in _PERFETTO_TRACKS[:-1]:
+            if key in flags:
+                return pid
+        return normal_pid
+
+    events: List[dict] = []
+    for _key, label, _cname, pid in _PERFETTO_TRACKS:
+        events.append(
+            {
+                "ph": "M",
+                "pid": pid,
+                "name": "process_name",
+                "args": {"name": f"graph pool — {label}"},
+            }
+        )
+    events.append(
+        {
+            "ph": "M",
+            "pid": _PERFETTO_COUNTER_PID,
+            "name": "process_name",
+            "args": {"name": "graph pool — live bytes (MiB)"},
+        }
+    )
+
+    uid = 0
+    for b in result["bars"]:
+        pid = categorize(b["flags"])
+        uid += 1
+        ts = b["alloc_ord"]
+        dur = max(b["free_ord"] - b["alloc_ord"], 1)
+        args = {
+            "size_MiB": round(b["size"] / (1024 * 1024), 3),
+            "size_bytes": b["size"],
+            "addr": hex(b["addr"]),
+            "pool_id": str(b["pool_id"]),
+            "flags": ",".join(b["flags"]) or "none",
+            "never_freed": b["never_freed"],
+            "alloc_ord": b["alloc_ord"],
+            "free_ord": b["free_ord"],
+        }
+        events.append(
+            {
+                "ph": "b",
+                "pid": pid,
+                "tid": 0,
+                "id": uid,
+                "cat": "alloc",
+                "name": b["label"],
+                "ts": ts,
+                "cname": cname_by_pid[pid],
+                "args": args,
+            }
+        )
+        events.append(
+            {
+                "ph": "e",
+                "pid": pid,
+                "tid": 0,
+                "id": uid,
+                "cat": "alloc",
+                "name": b["label"],
+                "ts": ts + dur,
+            }
+        )
+
+    # Counter track: graph-pool live bytes over capture order.
+    deltas: List[Tuple[int, int]] = []
+    for b in result["bars"]:
+        deltas.append((b["alloc_ord"], b["size"]))
+        deltas.append((b["free_ord"], -b["size"]))
+    deltas.sort()
+    live = 0
+    for ts, d in deltas:
+        live += d
+        events.append(
+            {
+                "ph": "C",
+                "pid": _PERFETTO_COUNTER_PID,
+                "ts": ts,
+                "name": "live",
+                "args": {"MiB": round(live / (1024 * 1024), 2)},
+            }
+        )
+
+    return {
+        "displayTimeUnit": "ns",
+        "traceEvents": events,
+        "metadata": {
+            "tool": "cg_mem_inspect",
+            "x_axis": "capture-order allocator event ordinal (not wall-clock)",
+            "peak_live_MiB": round(result["peak_live_bytes"] / (1024 * 1024), 2),
+            "cross_graph_signature": result["cross_graph_signature"],
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", help="path to a torch memory snapshot pickle")
@@ -528,6 +651,9 @@ def main() -> int:
         json.dump(result, f, indent=2, default=str)
     with open(html_path, "w") as f:
         f.write(to_html(result, title=args.title, max_rows=args.max_rows))
+    perfetto_path = os.path.join(out_dir, f"{base}.perfetto.json")
+    with open(perfetto_path, "w") as f:
+        json.dump(to_perfetto(result), f, default=str)
 
     sig = result["signatures_present"]
     print(
@@ -543,6 +669,7 @@ def main() -> int:
     )
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
+    print(f"Perfetto (load at https://ui.perfetto.dev): {perfetto_path}")
     return 0
 
 

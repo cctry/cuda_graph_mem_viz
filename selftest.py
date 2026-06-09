@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 
-from .analyzer import analyze
+from .analyzer import analyze, to_perfetto
 from .schema import SchemaError, normalize
 
 MiB = 1024 * 1024
@@ -207,6 +207,23 @@ def run() -> int:
         failures.append("bridge-backed huge_kv should carry precise S3_non_reusable")
     if huge2 is not None and "bridge" not in huge2["label"]:
         failures.append("bridge-backed alloc label should mention bridge")
+
+    # Perfetto export: valid Chrome-trace with a slice per bar + a counter track.
+    trace = to_perfetto(result)
+    te = trace.get("traceEvents", [])
+    begins = [e for e in te if e.get("ph") == "b"]
+    counters = [e for e in te if e.get("ph") == "C"]
+    names = [e for e in te if e.get("ph") == "M" and e.get("name") == "process_name"]
+    if len(begins) != result["num_allocations_shown"]:
+        failures.append(
+            f"perfetto: expected {result['num_allocations_shown']} slices, got {len(begins)}"
+        )
+    if not counters:
+        failures.append("perfetto: missing live-bytes counter track")
+    if not names:
+        failures.append("perfetto: missing track (process_name) metadata")
+    if not all("ts" in e for e in begins):
+        failures.append("perfetto: slice begin events must carry a ts")
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:
