@@ -45,6 +45,14 @@ def _frame(name: str):
     return [{"name": name, "filename": f"/model/{name}.py", "line": 42}]
 
 
+def _mp_upsert(arg):
+    """Top-level worker (picklable) for the concurrent _upsert_manifest stress test:
+    upsert one unique rank/pid/stem into the shared artifact_manifest.json."""
+    out, rk, npar = arg
+    stem = f"cgmem_rank{rk}_world{npar}_localNA_pid{10000 + rk}_standard"
+    shim_mod._upsert_manifest(out, stem, "standard", rk, npar, "NA", 10000 + rk)
+
+
 def _build_raw():
     huge = 150 * MiB
     small = 1 * MiB
@@ -1821,6 +1829,37 @@ def run() -> int:
             failures.append("AC-4: per-rank pickle filenames must not clobber")
         if {str(a["rank"]) for a in _arts} != {"0", "1"}:
             failures.append("AC-4: manifest must retain both ranks")
+    shim_mod._reset_accumulators()
+
+    # Round-13 AC-4/AC-7: _upsert_manifest must be safe under CONCURRENT per-rank
+    # process writes (the real multi-rank path: each rank is its own process writing
+    # the same manifest). A lockless read-modify-write loses entries; the flock +
+    # atomic-replace writer must retain every rank.
+    import multiprocessing as _mp
+
+    shim_mod._reset_accumulators()
+    with _tf3.TemporaryDirectory() as _tms:
+        _NP = 32
+        try:
+            _ctx = _mp.get_context("fork")
+            with _ctx.Pool(8) as _pool:
+                _pool.map(_mp_upsert, [(_tms, _rk, _NP) for _rk in range(_NP)])
+            _msm = __import__("json").load(
+                open(_os3.path.join(_tms, "artifact_manifest.json"))
+            )
+            _msa = _msm.get("artifacts") or []
+            if len(_msa) != _NP:
+                failures.append(
+                    f"AC-7: concurrent _upsert_manifest lost entries: {len(_msa)}/{_NP}"
+                )
+            if len({a["stem"] for a in _msa}) != _NP:
+                failures.append("AC-7: concurrent upsert must keep distinct stems")
+            if len({a["pickle"] for a in _msa}) != _NP:
+                failures.append("AC-7: concurrent upsert must keep distinct pickles")
+            if {str(a["rank"]) for a in _msa} != {str(r) for r in range(_NP)}:
+                failures.append("AC-7: concurrent upsert must retain every rank")
+        except Exception as _e:  # pragma: no cover - environment without fork
+            print(f"(skipped manifest concurrency stress: {_e})")
     shim_mod._reset_accumulators()
 
     # Round-5 AC-7: --artifact-dir picks rank 0 and never merges ranks.

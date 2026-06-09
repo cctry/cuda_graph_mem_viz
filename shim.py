@@ -33,6 +33,11 @@ import os
 import sys
 import threading
 
+try:
+    import fcntl  # POSIX advisory file locking (Linux/macOS)
+except ImportError:  # pragma: no cover - non-POSIX fallback (best-effort, no lock)
+    fcntl = None
+
 ENABLED_ENV = "CG_MEM_INSPECT"
 OUTDIR_ENV = "CG_MEM_INSPECT_OUTDIR"
 MAX_ENTRIES_ENV = "CG_MEM_INSPECT_MAX_ENTRIES"
@@ -217,16 +222,17 @@ def _extract_graph_slots(runner) -> None:
 
 
 def _upsert_manifest(out, stem, runner, rank, world, local, pid) -> None:
-    """Add/replace this artifact's entry in artifact_manifest.json (no clobber)."""
+    """Add/replace this artifact's entry in artifact_manifest.json, concurrency-safe.
+
+    Every rank runs in its own (spawned) process and writes the SAME manifest, so a
+    lockless read-modify-write loses entries. This takes an exclusive ``flock`` on a
+    per-directory lock file for the whole read→merge→write, merges the entry by
+    ``stem`` (preserving all unrelated ranks/runners), and replaces the file
+    atomically (temp file + fsync + ``os.replace``). A genuinely unparseable existing
+    manifest is reported loudly rather than silently overwritten with one entry.
+    """
     path = os.path.join(out, "artifact_manifest.json")
-    try:
-        manifest = json.load(open(path)) if os.path.exists(path) else {}
-    except Exception:
-        manifest = {}
-    if not isinstance(manifest, dict) or not isinstance(
-        manifest.get("artifacts"), list
-    ):
-        manifest = {"schema_version": SIDECAR_SCHEMA_VERSION, "artifacts": []}
+    lock_path = path + ".lock"
     entry = {
         "stem": stem,
         "runner": runner,
@@ -239,12 +245,43 @@ def _upsert_manifest(out, stem, runner, rank, world, local, pid) -> None:
         "window_keys": [w.get("window_key") for w in _capture_windows],
         "segment_keys": [w.get("window_key") for w in _segment_windows],
     }
-    manifest["artifacts"] = [
-        a for a in manifest["artifacts"] if a.get("stem") != stem
-    ] + [entry]
     try:
-        with open(path, "w") as f:
-            json.dump(manifest, f, indent=2, default=str)
+        with open(lock_path, "a+") as lockf:
+            if fcntl is not None:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            try:
+                manifest = None
+                if os.path.exists(path):
+                    try:
+                        with open(path) as f:
+                            manifest = json.load(f)
+                    except Exception as e:
+                        # Do not silently drop existing ranks on a corrupt read.
+                        print(
+                            f"[cg_mem_inspect] WARNING: unparseable {path} ({e}); "
+                            "rebuilding manifest from this entry only",
+                            file=sys.stderr,
+                        )
+                        manifest = None
+                if not isinstance(manifest, dict) or not isinstance(
+                    manifest.get("artifacts"), list
+                ):
+                    manifest = {
+                        "schema_version": SIDECAR_SCHEMA_VERSION,
+                        "artifacts": [],
+                    }
+                manifest["artifacts"] = [
+                    a for a in manifest["artifacts"] if a.get("stem") != stem
+                ] + [entry]
+                tmp = f"{path}.tmp.{pid}"
+                with open(tmp, "w") as f:
+                    json.dump(manifest, f, indent=2, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)  # atomic publish under the lock
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
     except Exception as e:  # pragma: no cover
         print(f"[cg_mem_inspect] manifest write failed: {e}", file=sys.stderr)
 
