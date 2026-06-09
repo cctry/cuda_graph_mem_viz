@@ -15,12 +15,24 @@ import sys
 
 try:
     from . import shim as shim_mod
-    from .analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
+    from .analyzer import (
+        _run_artifact_dir,
+        _run_compare_ranks,
+        analyze,
+        to_html,
+        to_perfetto,
+    )
     from .schema import SchemaError, normalize
     from .shim import _window_key
 except ImportError:  # run directly by path
     import shim as shim_mod
-    from analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
+    from analyzer import (
+        _run_artifact_dir,
+        _run_compare_ranks,
+        analyze,
+        to_html,
+        to_perfetto,
+    )
     from schema import SchemaError, normalize
     from shim import _window_key
 
@@ -1686,6 +1698,29 @@ def run() -> int:
     if any("finding_ids" in e["args"] or "detectors" in e["args"] for e in ow_sl):
         failures.append("AC-9: no-finding slices must carry no finding metadata keys")
 
+    # Round-11 AC-9: per-window report signature_counts is finding-derived, not legacy
+    # flags. The one-window ordinary report must have empty signature_counts while
+    # legacy_flag_counts still records the heuristic S1_lingering for debug.
+    ow_std = (owr["reports"].get("standard") or [{}])[0]
+    if ow_std.get("signature_counts") != {}:
+        failures.append(
+            f"AC-9: nested report signature_counts must be finding-derived ({{}}), "
+            f"got {ow_std.get('signature_counts')}"
+        )
+    if ow_std.get("legacy_flag_counts") != {"S1_lingering": 2}:
+        failures.append(
+            "AC-9: nested report legacy_flag_counts must keep the raw S1_lingering debug map"
+        )
+    # A finding-bearing report group must count its detector under signature_counts.
+    enr_seg0 = (enr["reports"].get("breakable") or [{}])[0]
+    if not enr_seg0.get("signature_counts") or any(
+        k.startswith("S1_") or k.startswith("S2_") or k.startswith("S3_")
+        for k in enr_seg0.get("signature_counts", {})
+    ):
+        failures.append(
+            "AC-9: a finding-bearing report group must count detectors (not legacy S flags)"
+        )
+
     # Round-10 AC-9: a segment-only non_reusable finding must update the summary
     # state (S3_non_reusable True; cross_graph_signature not "none").
     if not sres["signatures_present"].get("S3_non_reusable"):
@@ -1962,6 +1997,180 @@ def run() -> int:
             failures.append(
                 "AC-7: a manifest sidecar path differing from the sibling stem must be honored"
             )
+
+    # Round-11 task11: --compare-ranks + per-variant high-water regression baseline.
+    def _cmp_args(_d, **over):
+        a = _mk_args(_d)
+        a.compare_ranks = True
+        a.save_baseline = None
+        a.load_baseline = None
+        a.baseline_regression_threshold_fraction = 0.0
+        for k, v in over.items():
+            setattr(a, k, v)
+        return a
+
+    def _pool_raw(alloc_mib):
+        sz = alloc_mib * MiB
+        return {
+            "segments": [
+                {
+                    "address": GP,
+                    "total_size": 64 * MiB,
+                    "stream": 1,
+                    "segment_pool_id": (0, 1),
+                    "segment_type": "large",
+                    "blocks": [
+                        {
+                            "address": GP,
+                            "size": sz,
+                            "requested_size": sz,
+                            "state": "active_allocated",
+                            "frames": _frame("buf"),
+                        },
+                        {
+                            "address": GP + sz,
+                            "size": 64 * MiB - sz,
+                            "requested_size": 0,
+                            "state": "inactive",
+                            "frames": [],
+                        },
+                    ],
+                }
+            ],
+            "device_traces": [_ev([("alloc", GP, sz, "buf")])],
+            "allocator_settings": {},
+            "external_annotations": [],
+        }
+
+    def _cmp_side(rk):
+        return {
+            "schema_version": 1,
+            "runner": "standard",
+            "rank": rk,
+            "world": 2,
+            "local_rank": "0",
+            "pid": 200 + rk,
+            "max_entries": 1000,
+            "pool_handle": "(0, 1)",
+            "capture_windows": [
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 1,
+                    "stream_idx": 0,
+                    "begin_ord": 0,
+                    "end_ord": 1,
+                    "window_key": f"r{rk}/bs1",
+                }
+            ],
+            "segment_windows": [],
+            "graph_slots": [],
+            "bridges": [],
+        }
+
+    def _build_cmp_dir(_d, ranks_sizes):
+        for rk, mib in ranks_sizes.items():
+            with open(_os2.path.join(_d, f"art_rank{rk}.pickle"), "wb") as _f:
+                _pk.dump(_pool_raw(mib), _f)
+            with open(_os2.path.join(_d, f"art_rank{rk}.sidecar.json"), "w") as _f:
+                _j.dump(_cmp_side(rk), _f)
+        with open(_os2.path.join(_d, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": f"art_rank{rk}",
+                            "rank": rk,
+                            "world": 2,
+                            "pickle": f"art_rank{rk}.pickle",
+                            "sidecar": f"art_rank{rk}.sidecar.json",
+                        }
+                        for rk in ranks_sizes
+                    ],
+                },
+                _f,
+            )
+
+    with _tf.TemporaryDirectory() as _tc:
+        _build_cmp_dir(_tc, {0: 8, 1: 8})
+        if _run_compare_ranks(_cmp_args(_tc)) != 0:
+            failures.append(
+                "task11: --compare-ranks should succeed on a two-rank manifest"
+            )
+        cmp_path = _os2.path.join(_tc, "cross_rank_comparison.json")
+        if not _os2.path.exists(cmp_path):
+            failures.append(
+                "task11: --compare-ranks must write cross_rank_comparison.json"
+            )
+        else:
+            cj = _j.load(open(cmp_path))
+            if cj.get("ranks") != ["0", "1"]:
+                failures.append("task11: comparison must cover both ranks")
+            if not cj.get("comparison"):
+                failures.append("task11: comparison must contain per-variant rows")
+            else:
+                row = cj["comparison"][0]
+                if (
+                    "high_water_bytes_by_rank" not in row
+                    or "delta_from_rank0_by_rank" not in row
+                ):
+                    failures.append(
+                        "task11: comparison rows need per-rank high-water + deltas"
+                    )
+        if _os2.path.exists(_os2.path.join(_tc, "art_rank1.analysis.json")):
+            failures.append(
+                "task11: --compare-ranks must not emit ordinary merged analysis"
+            )
+
+    with _tf.TemporaryDirectory() as _tc2:
+        with open(_os2.path.join(_tc2, "art_rank0.pickle"), "wb") as _f:
+            _pk.dump(_pool_raw(8), _f)
+        with open(_os2.path.join(_tc2, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 1,
+                            "pickle": "art_rank0.pickle",
+                            "sidecar": "art_rank0.sidecar.json",  # never written
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_compare_ranks(_cmp_args(_tc2)) == 0:
+            failures.append(
+                "task11: --compare-ranks must fail-closed on a missing sidecar"
+            )
+
+    with _tf.TemporaryDirectory() as _tb:
+        _build_cmp_dir(_tb, {0: 8})
+        _bpath = _os2.path.join(_tb, "baseline.json")
+        if _run_compare_ranks(_cmp_args(_tb, save_baseline=_bpath)) != 0:
+            failures.append("task11: --save-baseline run should succeed")
+        if not _os2.path.exists(_bpath):
+            failures.append("task11: --save-baseline must write the baseline file")
+        if _run_compare_ranks(_cmp_args(_tb, load_baseline=_bpath)) != 0:
+            failures.append(
+                "task11: loading a baseline against identical data must not regress"
+            )
+
+    with _tf.TemporaryDirectory() as _tb2:
+        _build_cmp_dir(_tb2, {0: 8})
+        _bpath2 = _os2.path.join(_tb2, "baseline.json")
+        _run_compare_ranks(_cmp_args(_tb2, save_baseline=_bpath2))
+        _build_cmp_dir(_tb2, {0: 40})  # grow the allocation -> high-water regression
+        if _run_compare_ranks(_cmp_args(_tb2, load_baseline=_bpath2)) == 0:
+            failures.append(
+                "task11: a high-water regression beyond threshold must return nonzero"
+            )
+        cj2 = _j.load(open(_os2.path.join(_tb2, "cross_rank_comparison.json")))
+        if not cj2.get("baseline_regressions"):
+            failures.append("task11: baseline_regressions[] must record the regression")
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

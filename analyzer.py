@@ -471,20 +471,27 @@ def _window_metrics(
     begin: int,
     end: int,
     graph_segs: Optional[List[dict]] = None,
+    findings_by_alloc: Optional[Dict[int, List[dict]]] = None,
 ) -> dict:
     """Per-window stats: counts, bytes, in-window peak, capped allocation records,
     and per-graph-pool-segment ``pool_layout`` (offsets + fragmentation/holes at the
     window peak).
 
-    ``peak_live_bytes`` clips each allocation's lifetime to ``[begin, end)`` so it
-    reflects bytes simultaneously live *during this window*, the quantity that
-    actually competes for the shared pool.
+    ``signature_counts`` is finding-derived (per detector) for the allocations
+    overlapping the window; the legacy S1/S2/S3 flag counts are kept only under
+    ``legacy_flag_counts``. ``peak_live_bytes`` clips each allocation's lifetime to
+    ``[begin, end)`` so it reflects bytes simultaneously live *during this window*,
+    the quantity that actually competes for the shared pool.
     """
     inwin = [a for a in graph if a.alloc_ord < end and begin < a.free_ord]
-    sigc: Dict[str, int] = {}
+    fba = findings_by_alloc or {}
+    sigc: Dict[str, int] = {}  # finding-derived (per detector)
+    legacy_flag_counts: Dict[str, int] = {}
     for a in inwin:
+        for f in fba.get(id(a), []):
+            sigc[f["detector"]] = sigc.get(f["detector"], 0) + 1
         for fl in a.flags:
-            sigc[fl] = sigc.get(fl, 0) + 1
+            legacy_flag_counts[fl] = legacy_flag_counts.get(fl, 0) + 1
     deltas: List[Tuple[int, int]] = []
     for a in inwin:
         deltas.append((max(a.alloc_ord, begin), a.size))
@@ -552,7 +559,9 @@ def _window_metrics(
         "total_bytes": sum(a.size for a in inwin),
         "peak_live_bytes": peak,
         "peak_live_at_ordinal": peak_at,
-        "signature_counts": sigc,
+        "signature_counts": sigc,  # finding-derived (per detector)
+        "finding_counts": dict(sigc),
+        "legacy_flag_counts": legacy_flag_counts,
         "allocations": records,
         "allocations_omitted": max(0, len(inwin) - len(records)),
         "pool_layout": pool_layout,
@@ -607,6 +616,7 @@ def _build_reports(
     segment_windows_raw: List[dict],
     bridges: Optional[List[dict]] = None,
     seg_summaries: Optional[List[dict]] = None,
+    findings_by_alloc: Optional[Dict[int, List[dict]]] = None,
 ) -> dict:
     """Group graph-pool allocations into per-window reports.
 
@@ -689,7 +699,7 @@ def _build_reports(
                 "stream_idx": w.get("stream_idx"),
                 "begin_ord": b,
                 "end_ord": e,
-                **_window_metrics(graph, b, e, graph_segs),
+                **_window_metrics(graph, b, e, graph_segs, findings_by_alloc),
             }
         )
     for w in segment_windows_raw:
@@ -709,7 +719,7 @@ def _build_reports(
                 "segment_idx": w.get("segment_idx"),
                 "begin_ord": b,
                 "end_ord": e,
-                **_window_metrics(graph, b, e, graph_segs),
+                **_window_metrics(graph, b, e, graph_segs, findings_by_alloc),
             }
         )
     breakable_caps = [w for w in capture_windows_raw if w.get("runner") == "breakable"]
@@ -1121,11 +1131,9 @@ def analyze(
         graph_slot_labels = _apply_graph_slots(
             snap, allocs, graph_slots, windows_by_key
         )
-        reports = _build_reports(
-            allocs, capture_windows_raw, segment_windows_raw, eff_bridges, seg_summaries
-        )
 
-        # AC-10 structured, impact-ranked findings + per-bar finding attachment.
+        # AC-10 structured, impact-ranked findings — built BEFORE reports so report
+        # groups (and bars) summarize findings, not the legacy S1/S2/S3 flags.
         graph_segs = [s for s in seg_summaries if s["is_graph_pool"]]
 
         def _keyed(w):
@@ -1143,6 +1151,14 @@ def analyze(
         }
         findings, findings_by_alloc = _build_findings(
             allocs, capture_keyed, segment_keyed, graph_segs, finding_thresholds
+        )
+        reports = _build_reports(
+            allocs,
+            capture_windows_raw,
+            segment_windows_raw,
+            eff_bridges,
+            seg_summaries,
+            findings_by_alloc,
         )
 
         shown = (
@@ -1635,27 +1651,30 @@ def to_perfetto(result: dict) -> dict:
     }
 
 
-def _run_one(
+def _load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:  # pragma: no cover
+        print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
+        return None
+
+
+def _analyze_pickle(
     snapshot_path: str,
     args,
     bridges_override=None,
     sidecar_override=None,
     manifest_override=None,
-) -> int:
-    """Analyze a single snapshot pickle (auto-discovering its sibling sidecars)."""
+) -> Optional[dict]:
+    """Load a snapshot pickle (+ sidecar/manifest) and return the analyze() result,
+    or None on a fail-closed error. An explicit ``sidecar_override`` is mandatory: a
+    missing/unreadable one returns None rather than analyzing without provenance."""
     try:
         snap = load(snapshot_path)
     except SchemaError as e:
         print(f"SCHEMA ERROR (failing closed): {e}", file=sys.stderr)
-        return 3
-
-    def _load_json(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:  # pragma: no cover
-            print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
-            return None
+        return None
 
     stem = os.path.splitext(snapshot_path)[0]
     dirn = os.path.dirname(os.path.abspath(snapshot_path))
@@ -1666,16 +1685,12 @@ def _run_one(
         d = _load_json(bpath)
         bridges = (d or {}).get("bridges")
 
-    # An explicit sidecar (from --sidecar or the artifact manifest) is fail-closed:
-    # if it is named but missing/unreadable we refuse to analyze, because dropping it
-    # would silently lose the rank/world provenance and capture windows. A sibling
-    # sidecar auto-discovered for a bare pickle stays optional.
     sidecar = None
     explicit_sidecar = sidecar_override is not None
     spath = sidecar_override or (stem + ".sidecar.json")
     if explicit_sidecar and not os.path.exists(spath):
         print(f"SIDECAR ERROR (failing closed): {spath} not found", file=sys.stderr)
-        return 3
+        return None
     if os.path.exists(spath):
         sidecar = _load_json(spath)
         if sidecar is None and explicit_sidecar:
@@ -1683,12 +1698,11 @@ def _run_one(
                 f"SIDECAR ERROR (failing closed): could not load {spath}",
                 file=sys.stderr,
             )
-            return 3
+            return None
         if sidecar:
             print(
                 f"loaded sidecar (windows={len(sidecar.get('capture_windows') or [])}, "
                 f"segments={len(sidecar.get('segment_windows') or [])}, "
-                f"slots={len(sidecar.get('graph_slots') or [])}, "
                 f"bridges={len(sidecar.get('bridges') or [])}) from {spath}"
             )
 
@@ -1698,7 +1712,7 @@ def _run_one(
         manifest = _load_json(mpath)
 
     try:
-        result = analyze(
+        return analyze(
             snap,
             include_default_pool=args.include_default_pool,
             bridges=bridges,
@@ -1716,7 +1730,23 @@ def _run_one(
         )
     except SchemaError as e:
         print(f"LAYOUT FAILS CLOSED: {e}", file=sys.stderr)
+        return None
+
+
+def _run_one(
+    snapshot_path: str,
+    args,
+    bridges_override=None,
+    sidecar_override=None,
+    manifest_override=None,
+) -> int:
+    """Analyze a single snapshot pickle (auto-discovering its sibling sidecars)."""
+    result = _analyze_pickle(
+        snapshot_path, args, bridges_override, sidecar_override, manifest_override
+    )
+    if result is None:
         return 3
+    dirn = os.path.dirname(os.path.abspath(snapshot_path))
 
     out_dir = args.out_dir or dirn
     os.makedirs(out_dir, exist_ok=True)
@@ -1837,6 +1867,222 @@ def _run_artifact_dir(args) -> int:
     return rc
 
 
+# --------------------------------------------------------------------------- #
+# task11: cross-rank comparison + per-variant high-water-mark regression baseline.
+# --------------------------------------------------------------------------- #
+
+_SHAPE_KEY_BY_RUNNER = {
+    "standard": "batch_size",
+    "piecewise": "num_tokens",
+    "breakable": "num_tokens",
+}
+
+
+def _high_water_rows(result: dict) -> Dict[Tuple, dict]:
+    """Per-variant high-water marks from one artifact's report, keyed by
+    ``(runner, shape_key, stream_idx, segment_idx, pool_id)``.
+
+    ``high_water_bytes`` is the active graph-pool bytes for that pool at the
+    window's peak ordinal (summed over the pool's segments); ``reserved_bytes`` is
+    the pool's reserved total."""
+    rows: Dict[Tuple, dict] = {}
+    reps = result.get("reports") or {}
+    for runner in ("standard", "piecewise", "breakable"):
+        shape_field = _SHAPE_KEY_BY_RUNNER[runner]
+        for w in reps.get(runner) or []:
+            shape = w.get(shape_field)
+            stream = w.get("stream_idx")
+            seg = w.get("segment_idx")
+            by_pool: Dict[str, dict] = {}
+            for s in w.get("pool_layout") or []:
+                p = str(s["pool_id"])
+                agg = by_pool.setdefault(p, {"active": 0, "reserved": 0})
+                agg["active"] += int(s.get("active_bytes_at_peak", 0))
+                agg["reserved"] += int(s.get("total_size", 0))
+            for p, agg in by_pool.items():
+                key = (runner, shape, stream, seg, p)
+                rows[key] = {
+                    "runner": runner,
+                    "shape_key": shape,
+                    "stream_idx": stream,
+                    "segment_idx": seg,
+                    "pool_id": p,
+                    "high_water_bytes": agg["active"],
+                    "reserved_bytes": agg["reserved"],
+                    "window_peak_live_bytes": int(w.get("peak_live_bytes", 0)),
+                }
+    return rows
+
+
+def _baseline_key(rank: str, r: dict) -> str:
+    return (
+        f"{r['runner']}|rank={rank}|shape={r['shape_key']}|stream={r['stream_idx']}"
+        f"|seg={r['segment_idx']}|pool={r['pool_id']}"
+    )
+
+
+def _run_compare_ranks(args) -> int:
+    """Analyze every rank's artifacts independently and emit a cross-rank comparison
+    (never merged). Optionally save/load a per-variant high-water-mark baseline and
+    fail (nonzero) on a regression beyond the threshold."""
+    man_path = os.path.join(args.artifact_dir, "artifact_manifest.json")
+    if not os.path.exists(man_path):
+        print(f"no artifact_manifest.json in {args.artifact_dir}", file=sys.stderr)
+        return 2
+    manifest = _load_json(man_path)
+    arts = (manifest or {}).get("artifacts") or []
+    if not arts:
+        print(f"no artifacts in {man_path}", file=sys.stderr)
+        return 2
+
+    # rank -> {variant_key: row}; also a per-(rank,artifact) summary.
+    by_rank: Dict[str, Dict[Tuple, dict]] = {}
+    artifact_summaries: List[dict] = []
+    analyzed = 0
+    rc = 0
+    for a in sorted(arts, key=lambda x: (str(x.get("rank")), str(x.get("runner")))):
+        rank = str(a.get("rank"))
+        stem = a.get("stem", "")
+        pkl = os.path.join(args.artifact_dir, a.get("pickle") or (stem + ".pickle"))
+        side = os.path.join(
+            args.artifact_dir, a.get("sidecar") or (stem + ".sidecar.json")
+        )
+        if not os.path.exists(pkl):
+            print(f"ERROR: missing pickle {pkl}", file=sys.stderr)
+            rc = rc or 2
+            continue
+        if not os.path.exists(side):
+            print(f"ERROR: missing sidecar {side}", file=sys.stderr)
+            rc = rc or 2
+            continue
+        result = _analyze_pickle(pkl, args, sidecar_override=side)
+        if result is None:
+            rc = rc or 3
+            continue
+        analyzed += 1
+        rows = _high_water_rows(result)
+        dst = by_rank.setdefault(rank, {})
+        dst.update(rows)
+        artifact_summaries.append(
+            {
+                "rank": result.get("rank"),
+                "world": result.get("world"),
+                "runner": result.get("runner"),
+                "graph_pool_peak_live_bytes": result.get("peak_live_bytes"),
+                "num_findings": result.get("finding_count"),
+            }
+        )
+    if analyzed == 0:
+        print("ERROR: compare-ranks analyzed 0 artifacts", file=sys.stderr)
+        return rc or 2
+
+    ranks = sorted(by_rank)
+    base_rank = "0" if "0" in ranks else ranks[0]
+    # Union of variant keys across all ranks; per-key per-rank high-water + delta.
+    all_keys = sorted(
+        {k for rows in by_rank.values() for k in rows},
+        key=lambda k: tuple(str(x) for x in k),
+    )
+    comparison_rows: List[dict] = []
+    for key in all_keys:
+        runner, shape, stream, seg, pool = key
+        per_rank = {}
+        for rank in ranks:
+            row = by_rank[rank].get(key)
+            if row is not None:
+                per_rank[rank] = row["high_water_bytes"]
+        base_hw = per_rank.get(base_rank)
+        comparison_rows.append(
+            {
+                "runner": runner,
+                "shape_key": shape,
+                "stream_idx": stream,
+                "segment_idx": seg,
+                "pool_id": pool,
+                "high_water_bytes_by_rank": per_rank,
+                "delta_from_rank0_by_rank": (
+                    {r: per_rank[r] - base_hw for r in per_rank}
+                    if base_hw is not None
+                    else {}
+                ),
+            }
+        )
+
+    out = {
+        "schema_version": 1,
+        "mode": "compare-ranks",
+        "ranks": ranks,
+        "base_rank": base_rank,
+        "artifact_summaries": artifact_summaries,
+        "comparison": comparison_rows,
+    }
+
+    # Baseline save: stable per-(rank, variant) high-water records.
+    if getattr(args, "save_baseline", None):
+        baseline = {
+            "schema_version": 1,
+            "rows": [
+                {
+                    **by_rank[rank][key],
+                    "rank": rank,
+                    "key": _baseline_key(rank, by_rank[rank][key]),
+                }
+                for rank in ranks
+                for key in sorted(by_rank[rank], key=lambda k: tuple(str(x) for x in k))
+            ],
+        }
+        with open(args.save_baseline, "w") as f:
+            json.dump(baseline, f, indent=2, default=str)
+        print(f"saved baseline ({len(baseline['rows'])} rows) to {args.save_baseline}")
+
+    # Baseline load: flag high-water regressions beyond the threshold.
+    regressions: List[dict] = []
+    if getattr(args, "load_baseline", None):
+        base = _load_json(args.load_baseline) or {}
+        base_by_key = {r.get("key"): r for r in base.get("rows") or []}
+        thr = float(getattr(args, "baseline_regression_threshold_fraction", 0.0) or 0.0)
+        for rank in ranks:
+            for key in by_rank[rank]:
+                r = by_rank[rank][key]
+                bkey = _baseline_key(rank, r)
+                old = base_by_key.get(bkey)
+                if old is None:
+                    continue
+                old_hw = int(old.get("high_water_bytes", 0))
+                new_hw = int(r["high_water_bytes"])
+                frac = (
+                    ((new_hw - old_hw) / old_hw) if old_hw else (1.0 if new_hw else 0.0)
+                )
+                if frac > thr:
+                    regressions.append(
+                        {
+                            "key": bkey,
+                            "old_high_water_bytes": old_hw,
+                            "new_high_water_bytes": new_hw,
+                            "delta_bytes": new_hw - old_hw,
+                            "fraction": frac,
+                            "threshold_fraction": thr,
+                        }
+                    )
+        out["baseline_regressions"] = regressions
+        out["baseline_regression_threshold_fraction"] = thr
+
+    out_dir = args.out_dir or args.artifact_dir
+    os.makedirs(out_dir, exist_ok=True)
+    cmp_path = os.path.join(out_dir, "cross_rank_comparison.json")
+    with open(cmp_path, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+    print(
+        f"compare-ranks: ranks={ranks} base={base_rank} "
+        f"variants={len(comparison_rows)} -> {cmp_path}"
+    )
+    if getattr(args, "load_baseline", None):
+        print(f"baseline regressions: {len(regressions)} (threshold {thr})")
+        if regressions:
+            return 4
+    return rc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1917,8 +2163,38 @@ def main() -> int:
         default=2,
         help="non_reusable_across_graphs: min capture windows the lifetime must span",
     )
+    # task11: cross-rank comparison + per-variant high-water-mark regression baseline.
+    parser.add_argument(
+        "--compare-ranks",
+        dest="compare_ranks",
+        action="store_true",
+        help="with --artifact-dir, analyze every rank independently and emit "
+        "cross_rank_comparison.json (never merges ranks; default stays rank-0-only)",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        dest="save_baseline",
+        default=None,
+        help="with --compare-ranks, write per-variant high-water marks to PATH",
+    )
+    parser.add_argument(
+        "--load-baseline",
+        dest="load_baseline",
+        default=None,
+        help="with --compare-ranks, compare high-water marks against a saved baseline "
+        "and exit nonzero on a regression beyond the threshold",
+    )
+    parser.add_argument(
+        "--baseline-regression-threshold-fraction",
+        dest="baseline_regression_threshold_fraction",
+        type=float,
+        default=0.0,
+        help="high-water regression fraction over baseline that fails the run",
+    )
     args = parser.parse_args()
 
+    if args.artifact_dir and args.compare_ranks:
+        return _run_compare_ranks(args)
     if args.artifact_dir:
         return _run_artifact_dir(args)
     if not args.snapshot:
