@@ -1205,6 +1205,111 @@ def run() -> int:
             "AC-9: the same tensor must sit at the same offset across tracks (vertical column)"
         )
 
+    # Round-8 AC-10: structured impact-ranked findings (pickle-only: result).
+    rfind = result.get("findings") or []
+    rdet = {f["detector"] for f in rfind}
+    if "oversized_capture_allocation" not in rdet:
+        failures.append(
+            "AC-10: huge_kv must yield an oversized_capture_allocation finding (pickle-only)"
+        )
+    if "long_lived_outlier" not in rdet:
+        failures.append("AC-10: scratch must yield a long_lived_outlier finding")
+    if "non_reusable_across_graphs" in rdet:
+        failures.append(
+            "AC-10: non_reusable must NOT be fabricated without capture windows or a bridge"
+        )
+    if any(rfind[i]["impact"] < rfind[i + 1]["impact"] for i in range(len(rfind) - 1)):
+        failures.append("AC-10: findings must be sorted by impact descending")
+    if rfind and rfind[0]["detector"] != "oversized_capture_allocation":
+        failures.append(
+            "AC-10: highest-impact finding here should be the oversized huge_kv"
+        )
+    if rfind:
+        for _k in (
+            "id",
+            "detector",
+            "label",
+            "addr",
+            "size_bytes",
+            "alloc_ord",
+            "free_ord",
+            "impact",
+            "evidence",
+            "thresholds",
+        ):
+            if _k not in rfind[0]:
+                failures.append(f"AC-10: finding record missing '{_k}'")
+    ft = result.get("finding_thresholds") or {}
+    for _k in (
+        "long_lived_span_pctile",
+        "long_lived_min_spanned_windows",
+        "oversized_size_pctile",
+        "oversized_min_pool_fraction",
+        "non_reusable_min_spanned_windows",
+    ):
+        if _k not in ft:
+            failures.append(f"AC-10: finding_thresholds missing '{_k}'")
+    if any("normal" in f["label"] for f in rfind):
+        failures.append(
+            "AC-10: a normal-sized, short-lived allocation must not be flagged"
+        )
+
+    # Round-8 AC-10: non_reusable via capture-window overlap (windowed sidecar, mmres).
+    mmfind = mmres.get("findings") or []
+    persist_nr = [
+        f
+        for f in mmfind
+        if f["detector"] == "non_reusable_across_graphs" and f["addr"] == GP
+    ]
+    if not persist_nr:
+        failures.append(
+            "AC-10: a tensor spanning 2 capture windows must be non_reusable_across_graphs"
+        )
+    elif persist_nr[0]["evidence"] != "window_overlap":
+        failures.append(
+            "AC-10: window-spanning non_reusable evidence must be window_overlap"
+        )
+    if any(
+        f["detector"] == "non_reusable_across_graphs" and f["addr"] == GP + 8 * MiB
+        for f in mmfind
+    ):
+        failures.append("AC-10: a single-window allocation must NOT be non_reusable")
+
+    # Round-8 AC-10: non_reusable via a precise weak-ref bridge (segment crossing, wres).
+    wfind = wres.get("findings") or []
+    if not any(
+        f["detector"] == "non_reusable_across_graphs"
+        and f["evidence"] == "bridge_event_ord"
+        for f in wfind
+    ):
+        failures.append(
+            "AC-10: a precise weak-ref bridge must yield a bridge_event_ord non_reusable finding"
+        )
+
+    # Round-8 AC-9: findings highlighted on the Perfetto memory map.
+    mmpf = to_perfetto(mmres)
+    mmpf_sl = [e for e in mmpf["traceEvents"] if e.get("ph") == "X"]
+    persist_pf = [e for e in mmpf_sl if e["args"]["addr"] == hex(GP)]
+    if not persist_pf or all(
+        "non_reusable_across_graphs" not in e["args"]["detectors"] for e in persist_pf
+    ):
+        failures.append(
+            "AC-9: a flagged slice must carry its detector metadata in Perfetto"
+        )
+    if persist_pf and any(e.get("cname") == "grey" for e in persist_pf):
+        failures.append(
+            "AC-9: a flagged slice must be color-highlighted (not normal grey)"
+        )
+    t1_pf = [
+        e
+        for e in mmpf_sl
+        if e["args"]["addr"] == hex(GP + 8 * MiB) and e["args"]["alloc_ord"] == 3
+    ]
+    if t1_pf and any(e["args"]["detectors"] != "none" for e in t1_pf):
+        failures.append("AC-9: an unflagged slice must not carry finding metadata")
+    if mmpf["metadata"].get("finding_count") is None:
+        failures.append("AC-9: Perfetto metadata must include finding_count")
+
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
     try:

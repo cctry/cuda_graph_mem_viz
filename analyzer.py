@@ -727,6 +727,158 @@ def _build_reports(
     return reports
 
 
+# --------------------------------------------------------------------------- #
+# AC-10 structured, impact-ranked inefficiency findings.
+# --------------------------------------------------------------------------- #
+
+# detector -> Perfetto reserved color; precedence picks the slice color when an
+# allocation matches more than one detector (most severe first).
+_DETECTOR_CNAME = {
+    "oversized_capture_allocation": "terrible",
+    "non_reusable_across_graphs": "olive",
+    "long_lived_outlier": "bad",
+}
+_DETECTOR_PRECEDENCE = (
+    "oversized_capture_allocation",
+    "non_reusable_across_graphs",
+    "long_lived_outlier",
+)
+
+
+def _build_findings(
+    allocs: List[Allocation],
+    capture_windows: List[Tuple[int, int]],
+    segment_ranges: List[Tuple[int, int]],
+    graph_segs: List[dict],
+    thresholds: dict,
+) -> Tuple[List[dict], Dict[int, List[dict]]]:
+    """Structured, impact-ranked findings for the three inefficiency signatures.
+
+    Returns ``(findings_sorted, by_alloc_id)`` where ``by_alloc_id`` maps
+    ``id(allocation) -> [finding, ...]`` so the bars/visualization can attach the
+    same records. ``impact = size_bytes * max(1, duration_span)``.
+
+    * ``oversized_capture_allocation`` works in pickle-only mode (size outlier).
+    * ``long_lived_outlier`` is a top-percentile lifetime among freed allocations.
+    * ``non_reusable_across_graphs`` requires real evidence — overlap of >1 capture
+      window, or a precise weak-ref bridge — and is never fabricated when neither
+      capture windows nor a precise bridge are present.
+    """
+    graph = [a for a in allocs if _is_graph_pool(a.pool_id)]
+    sizes = [a.size for a in graph]
+    size_thr = _pct(sizes, thresholds["oversized_size_pctile"])
+    median = _pct(sizes, 0.5)
+    pool_total = sum(s["total_size"] for s in graph_segs)
+    freed_spans = [float(a.span) for a in graph if not a.never_freed]
+    span_thr = _pct(freed_spans, thresholds["long_lived_span_pctile"])
+    has_windows = bool(capture_windows)
+    ll_min = int(thresholds["long_lived_min_spanned_windows"])
+    nr_min = int(thresholds["non_reusable_min_spanned_windows"])
+
+    def _spanned(ranges: List[Tuple[int, int]], a: Allocation) -> int:
+        return sum(1 for lo, hi in ranges if a.alloc_ord < hi and lo < a.free_ord)
+
+    findings: List[dict] = []
+    by_alloc: Dict[int, List[dict]] = {}
+
+    def _emit(a: Allocation, detector: str, evidence: str, extra: dict) -> None:
+        dur = max(1, a.span)
+        rec = {
+            "id": f"{detector}@{hex(a.addr)}#{a.alloc_ord}-{a.free_ord}",
+            "detector": detector,
+            "label": a.label,
+            "slot_name": a.slot_name,
+            "label_source": "snapshot-backed",
+            "label_confidence": a.bridge_conf or "exact",
+            "addr": a.addr,
+            "pool_id": a.pool_id,
+            "size_bytes": a.size,
+            "alloc_ord": a.alloc_ord,
+            "free_ord": a.free_ord,
+            "never_freed": a.never_freed,
+            "duration_span": a.span,
+            "impact": a.size * dur,
+            "evidence": evidence,
+            "thresholds": extra.pop("thresholds", {}),
+            **extra,
+        }
+        findings.append(rec)
+        by_alloc.setdefault(id(a), []).append(rec)
+
+    for a in graph:
+        spanned_cap = _spanned(capture_windows, a)
+        spanned_seg = _spanned(segment_ranges, a)
+
+        # Oversized capture-time allocation (pickle-only capable).
+        if sizes and (
+            (a.size >= size_thr and a.size > median)
+            or (
+                pool_total
+                and a.size >= thresholds["oversized_min_pool_fraction"] * pool_total
+            )
+        ):
+            _emit(
+                a,
+                "oversized_capture_allocation",
+                "pickle_size_only",
+                {
+                    "pool_fraction": (a.size / pool_total) if pool_total else None,
+                    "thresholds": {
+                        "oversized_size_pctile": thresholds["oversized_size_pctile"],
+                        "oversized_min_pool_fraction": thresholds[
+                            "oversized_min_pool_fraction"
+                        ],
+                    },
+                },
+            )
+
+        # Long-lived outlier: top-percentile lifetime among freed allocations.
+        if (
+            not a.never_freed
+            and freed_spans
+            and a.span >= span_thr
+            and a.span > 0
+            and (not has_windows or spanned_cap >= ll_min)
+        ):
+            _emit(
+                a,
+                "long_lived_outlier",
+                "window_overlap" if has_windows else "pickle_span_percentile",
+                {
+                    "spanned_capture_windows": spanned_cap,
+                    "thresholds": {
+                        "long_lived_span_pctile": thresholds["long_lived_span_pctile"],
+                        "long_lived_min_spanned_windows": ll_min,
+                    },
+                },
+            )
+
+        # Non-reusable across graphs: needs real evidence (window overlap or a
+        # precise bridge); never fabricated when neither is present.
+        nr_ev = None
+        if has_windows and spanned_cap >= nr_min:
+            nr_ev = "window_overlap"
+        elif (a.bridge_conf or "").startswith("precise"):
+            nr_ev = "bridge_event_ord"
+        if nr_ev:
+            _emit(
+                a,
+                "non_reusable_across_graphs",
+                nr_ev,
+                {
+                    "spanned_capture_windows": spanned_cap,
+                    "spanned_segment_windows": spanned_seg,
+                    "bytes_non_reusable": a.size,
+                    "thresholds": {
+                        "non_reusable_min_spanned_windows": nr_min,
+                    },
+                },
+            )
+
+    findings.sort(key=lambda f: f["impact"], reverse=True)
+    return findings, by_alloc
+
+
 def _resolve_availability(snap: NormalizedSnapshot, manifest: Optional[dict]) -> dict:
     """Feature availability = manifest ∩ snapshot.
 
@@ -785,6 +937,8 @@ def analyze(
     s2_size_pctile: float = 0.95,
     s2_pool_fraction: float = 0.10,
     s1_span_pctile: float = 0.75,
+    long_lived_min_spanned_windows: int = 1,
+    non_reusable_min_spanned_windows: int = 2,
 ) -> dict:
     sc = sidecar or {}
     eff_bridges = sc.get("bridges") if sc.get("bridges") is not None else bridges
@@ -929,6 +1083,20 @@ def analyze(
             allocs, capture_windows_raw, segment_windows_raw, eff_bridges, seg_summaries
         )
 
+        # AC-10 structured, impact-ranked findings + per-bar finding attachment.
+        graph_segs = [s for s in seg_summaries if s["is_graph_pool"]]
+        segment_ranges = [r for w in segment_windows_raw if (r := _ord_range(w))]
+        finding_thresholds = {
+            "long_lived_span_pctile": s1_span_pctile,
+            "long_lived_min_spanned_windows": long_lived_min_spanned_windows,
+            "oversized_size_pctile": s2_size_pctile,
+            "oversized_min_pool_fraction": s2_pool_fraction,
+            "non_reusable_min_spanned_windows": non_reusable_min_spanned_windows,
+        }
+        findings, findings_by_alloc = _build_findings(
+            allocs, capture_windows, segment_ranges, graph_segs, finding_thresholds
+        )
+
         shown = (
             allocs
             if include_default_pool
@@ -936,24 +1104,31 @@ def analyze(
         )
         # Peak is scoped to the set being reported (graph pool by default).
         peak, peak_at = _peak_live_bytes(shown, end)
-        bars = [
-            {
-                "addr": a.addr,
-                "size": a.size,
-                "alloc_ord": a.alloc_ord,
-                "free_ord": a.free_ord,
-                "span": a.span,
-                "never_freed": a.never_freed,
-                "pool_id": a.pool_id,
-                "label": a.label,
-                "flags": a.flags,
-                "slot_name": a.slot_name,
-                "source": "snapshot-backed",
-                "confidence": a.bridge_conf or "exact",
-            }
-            for a in sorted(shown, key=lambda x: x.alloc_ord)
-        ]
+        bars = []
+        for a in sorted(shown, key=lambda x: x.alloc_ord):
+            af = findings_by_alloc.get(id(a), [])
+            bars.append(
+                {
+                    "addr": a.addr,
+                    "size": a.size,
+                    "alloc_ord": a.alloc_ord,
+                    "free_ord": a.free_ord,
+                    "span": a.span,
+                    "never_freed": a.never_freed,
+                    "pool_id": a.pool_id,
+                    "label": a.label,
+                    "flags": a.flags,
+                    "slot_name": a.slot_name,
+                    "source": "snapshot-backed",
+                    "confidence": a.bridge_conf or "exact",
+                    "finding_ids": [f["id"] for f in af],
+                    "finding_detectors": [f["detector"] for f in af],
+                    "finding_impact": max((f["impact"] for f in af), default=0),
+                }
+            )
         features_used += ["capture_order_lifetime", "gantt", "signatures"]
+        if findings:
+            features_used.append("findings")
         if eff_bridges or graph_slots or capture_windows:
             features_used.append("sidecar_join")
         gantt_available = True
@@ -968,6 +1143,8 @@ def analyze(
             "S3_approx": True,
         }
         bars = []
+        findings = []
+        finding_thresholds = {}
         peak = sum(
             s["active_bytes"]
             for s in seg_summaries
@@ -1044,6 +1221,9 @@ def analyze(
         "num_allocations_shown": len(bars),
         "signature_counts": sig_counts,
         "bars": bars,
+        "findings": findings,
+        "finding_count": len(findings),
+        "finding_thresholds": finding_thresholds,
         "lifetime_axis": "capture_order_event_ordinal",
         "bridges_matched": bridges_matched,
         "cross_graph_signature": cross,
@@ -1157,9 +1337,15 @@ def to_html(
         width = max(0.4, 100.0 * (b["free_ord"] - b["alloc_ord"]) / end)
         color = _bar_color(b["flags"])
         flagtxt = ", ".join(_FLAG_LABEL.get(f, f) for f in b["flags"]) or "ok"
+        find_txt = ""
+        if b.get("finding_detectors"):
+            find_txt = (
+                f" | findings: {', '.join(b['finding_detectors'])}"
+                f" (impact {b.get('finding_impact', 0)})"
+            )
         tip = html.escape(
             f"{b['label']} | {_mib(b['size'])} | ord {b['alloc_ord']}->"
-            f"{'END' if b['never_freed'] else b['free_ord']} | pool {b['pool_id']} | {flagtxt}"
+            f"{'END' if b['never_freed'] else b['free_ord']} | pool {b['pool_id']} | {flagtxt}{find_txt}"
         )
         lbl = html.escape(f"{_mib(b['size'])}  {b['label']}")
         rows.append(
@@ -1242,6 +1428,16 @@ def _perfetto_cname(flags: List[str]) -> str:
         if key in flags:
             return cname
     return _PERFETTO_NORMAL_COLOR
+
+
+def _slice_cname(bar: dict) -> str:
+    """Color a slice by its strongest matching detector (most severe first), so
+    AC-10 findings drive the highlight; fall back to the raw signature flags."""
+    dets = bar.get("finding_detectors") or []
+    for d in _DETECTOR_PRECEDENCE:
+        if d in dets:
+            return _DETECTOR_CNAME[d]
+    return _perfetto_cname(bar["flags"])
 
 
 def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
@@ -1333,7 +1529,7 @@ def to_perfetto(result: dict) -> dict:
                     "name": b["label"],
                     "ts": offset,
                     "dur": max(b["size"], 1),
-                    "cname": _perfetto_cname(b["flags"]),
+                    "cname": _slice_cname(b),
                     "args": {
                         "size_MiB": round(b["size"] / (1024 * 1024), 3),
                         "size_bytes": b["size"],
@@ -1342,6 +1538,10 @@ def to_perfetto(result: dict) -> dict:
                         "pool_id": str(b["pool_id"]),
                         "slot_name": b.get("slot_name"),
                         "flags": ",".join(b["flags"]) or "none",
+                        "finding_ids": ",".join(b.get("finding_ids") or []) or "none",
+                        "detectors": ",".join(b.get("finding_detectors") or [])
+                        or "none",
+                        "finding_impact": b.get("finding_impact", 0),
                         "window": label,
                         "alloc_ord": b["alloc_ord"],
                         "free_ord": b["free_ord"],
@@ -1361,6 +1561,8 @@ def to_perfetto(result: dict) -> dict:
             "num_tracks": len(tracks),
             "peak_live_MiB": round(result["peak_live_bytes"] / (1024 * 1024), 2),
             "cross_graph_signature": result["cross_graph_signature"],
+            "finding_count": result.get("finding_count", 0),
+            "finding_thresholds": result.get("finding_thresholds", {}),
         },
     }
 
@@ -1434,6 +1636,15 @@ def _run_one(
             bridges=bridges,
             sidecar=sidecar,
             manifest=manifest,
+            s2_size_pctile=getattr(args, "oversized_size_pctile", 0.95),
+            s2_pool_fraction=getattr(args, "oversized_min_pool_fraction", 0.10),
+            s1_span_pctile=getattr(args, "long_lived_span_pctile", 0.75),
+            long_lived_min_spanned_windows=getattr(
+                args, "long_lived_min_spanned_windows", 1
+            ),
+            non_reusable_min_spanned_windows=getattr(
+                args, "non_reusable_min_spanned_windows", 2
+            ),
         )
     except SchemaError as e:
         print(f"LAYOUT FAILS CLOSED: {e}", file=sys.stderr)
@@ -1471,6 +1682,21 @@ def _run_one(
             f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
         )
         print(f"cross-graph: {result['cross_graph_signature']}")
+        fcount: Dict[str, int] = {}
+        for fdg in result.get("findings") or []:
+            fcount[fdg["detector"]] = fcount.get(fdg["detector"], 0) + 1
+        top = result.get("findings") or []
+        print(
+            f"findings: {result.get('finding_count', 0)} "
+            f"(long_lived={fcount.get('long_lived_outlier', 0)} "
+            f"oversized={fcount.get('oversized_capture_allocation', 0)} "
+            f"non_reusable={fcount.get('non_reusable_across_graphs', 0)})"
+            + (
+                f"; top: {top[0]['detector']} {top[0]['label']} impact={top[0]['impact']}"
+                if top
+                else ""
+            )
+        )
     else:
         print("Gantt/lifetime DISABLED (degraded layout-only report).")
     print(f"JSON: {json_path}  HTML: {html_path}  Perfetto: {perfetto_path}")
@@ -1592,6 +1818,43 @@ def main() -> int:
         type=int,
         default=None,
         help="with --artifact-dir, select this rank instead of rank 0 (never merges ranks)",
+    )
+    # AC-10 detector thresholds (effective values are stamped into the report under
+    # finding_thresholds).
+    parser.add_argument(
+        "--long-lived-span-pctile",
+        dest="long_lived_span_pctile",
+        type=float,
+        default=0.75,
+        help="long_lived_outlier: lifetime-span percentile among freed allocations",
+    )
+    parser.add_argument(
+        "--long-lived-min-spanned-windows",
+        dest="long_lived_min_spanned_windows",
+        type=int,
+        default=1,
+        help="long_lived_outlier: min capture windows the lifetime must span (when windows exist)",
+    )
+    parser.add_argument(
+        "--oversized-size-pctile",
+        dest="oversized_size_pctile",
+        type=float,
+        default=0.95,
+        help="oversized_capture_allocation: size percentile among graph-pool allocations",
+    )
+    parser.add_argument(
+        "--oversized-min-pool-fraction",
+        dest="oversized_min_pool_fraction",
+        type=float,
+        default=0.10,
+        help="oversized_capture_allocation: min fraction of reserved pool bytes",
+    )
+    parser.add_argument(
+        "--non-reusable-min-spanned-windows",
+        dest="non_reusable_min_spanned_windows",
+        type=int,
+        default=2,
+        help="non_reusable_across_graphs: min capture windows the lifetime must span",
     )
     args = parser.parse_args()
 
