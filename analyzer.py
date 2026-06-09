@@ -149,6 +149,17 @@ def _segment_summaries(snap: NormalizedSnapshot) -> List[dict]:
             and b.size > b.requested_size
         )
         largest_hole = max((b.size for b in s.blocks if not b.is_active), default=0)
+        blocks = [
+            {
+                "address": b.address,
+                "offset": (b.address - s.address) if b.address is not None else None,
+                "size": b.size,
+                "requested_size": b.requested_size,
+                "state": b.state,
+                "label": _user_frame_label(b.frames) if b.frames else None,
+            }
+            for b in s.blocks
+        ]
         out.append(
             {
                 "address": s.address,
@@ -162,6 +173,7 @@ def _segment_summaries(snap: NormalizedSnapshot) -> List[dict]:
                 "fragmentation": (inactive / s.total_size) if s.total_size else 0.0,
                 "padding_waste": padding,
                 "num_blocks": len(s.blocks),
+                "blocks": blocks,
             }
         )
     return out
@@ -267,78 +279,172 @@ def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> Tuple[int, 
     return len(flagged), len(candidates)
 
 
+def _resolve_availability(
+    snap: NormalizedSnapshot, manifest: Optional[dict]
+) -> Tuple[bool, bool, str]:
+    """Return (block_address_ok, history_ok, source) gating layout & lifetime.
+
+    A provided capability manifest takes precedence (AC-1.1): if it marks history
+    absent, lifetime/Gantt stay disabled even if the snapshot happens to carry
+    events. Without a manifest, availability is derived from the snapshot itself.
+    """
+    if manifest and isinstance(manifest.get("capabilities"), dict):
+        caps = manifest["capabilities"]
+
+        def proven(key: str) -> bool:
+            return bool(caps.get(key, {}).get("proven", False))
+
+        history = proven("device_traces_present") and proven("device_traces_action")
+        return proven("block_explicit_address"), history, "manifest"
+    fa = snap.field_availability
+    return bool(fa.get("block_address")), bool(fa.get("device_traces")), "snapshot"
+
+
 def analyze(
     snap: NormalizedSnapshot,
     include_default_pool: bool = False,
     window_boundaries: Optional[List[int]] = None,
     bridges: Optional[List[dict]] = None,
+    manifest: Optional[dict] = None,
     s2_size_pctile: float = 0.95,
     s2_pool_fraction: float = 0.10,
     s1_span_pctile: float = 0.75,
 ) -> dict:
-    allocs, end = _extract_allocations(snap)
+    block_address_ok, history_ok, avail_source = _resolve_availability(snap, manifest)
+
+    # AC-2: fail closed when block addresses are missing — never fabricate offsets.
+    # Exception: a manifest that explicitly marks layout unavailable degrades instead.
+    if block_address_ok:
+        layout_available = True
+    elif avail_source == "manifest":
+        layout_available = False
+    else:
+        raise SchemaError(
+            "block addresses missing from the snapshot — pickle-only layout fails "
+            "closed (AC-2). Re-capture so every block carries an explicit address, "
+            "or supply a manifest that marks layout unavailable."
+        )
+
     seg_summaries = _segment_summaries(snap)
-    signatures = _flag_signatures(
-        allocs,
-        seg_summaries,
-        window_boundaries,
-        s2_size_pctile,
-        s2_pool_fraction,
-        s1_span_pctile,
-    )
-
-    bridge_allocs_flagged, bridge_ptrs_matched = (
-        _apply_bridges(allocs, bridges) if bridges else (0, 0)
-    )
-    bridges_matched = bridge_ptrs_matched
-    if bridges:
-        signatures["S3_non_reusable"] = (
-            signatures.get("S3_non_reusable", False) or bridge_allocs_flagged > 0
-        )
-        signatures["S3_approx"] = False  # bridges give a precise cross-segment source
-        signatures["S3_bridge_ptrs_matched"] = bridge_ptrs_matched
-        signatures["S3_bridge_ptrs_total"] = len(
-            {
-                int(b["storage_data_ptr"])
-                for b in bridges
-                if b.get("storage_data_ptr") is not None
-            }
-        )
-        signatures["S3_bridge_allocs_flagged"] = bridge_allocs_flagged
-
-    shown = (
-        allocs
-        if include_default_pool
-        else [a for a in allocs if _is_graph_pool(a.pool_id)]
-    )
-    # Peak is scoped to the set being reported (graph pool by default), since the
-    # tool's subject is the shared graph pool, not unrelated eager allocations.
-    peak, peak_at = _peak_live_bytes(shown, end)
-    bars = [
-        {
-            "addr": a.addr,
-            "size": a.size,
-            "alloc_ord": a.alloc_ord,
-            "free_ord": a.free_ord,
-            "span": a.span,
-            "never_freed": a.never_freed,
-            "pool_id": a.pool_id,
-            "label": a.label,
-            "flags": a.flags,
-        }
-        for a in sorted(shown, key=lambda x: x.alloc_ord)
-    ]
-
     graph_pools = sorted(
         {s["pool_id"] for s in seg_summaries if s["is_graph_pool"]}, key=str
     )
+    features_used: List[str] = []
+    features_skipped: List[str] = []
+    (
+        features_used.append("per_block_layout")
+        if layout_available
+        else features_skipped.append("per_block_layout (block addresses unavailable)")
+    )
+
+    lifetime_available = history_ok
+    bridges_matched = 0
+    if lifetime_available:
+        allocs, end = _extract_allocations(snap)
+        signatures = _flag_signatures(
+            allocs,
+            seg_summaries,
+            window_boundaries,
+            s2_size_pctile,
+            s2_pool_fraction,
+            s1_span_pctile,
+        )
+        bridge_allocs_flagged, bridge_ptrs_matched = (
+            _apply_bridges(allocs, bridges) if bridges else (0, 0)
+        )
+        bridges_matched = bridge_ptrs_matched
+        if bridges:
+            signatures["S3_non_reusable"] = (
+                signatures.get("S3_non_reusable", False) or bridge_allocs_flagged > 0
+            )
+            # Honest labeling: address-only representative matching is NOT precise
+            # (a bridge address is reused across captures). Stay approximate until
+            # event-window matching lands (Round 2). Precise only with explicit
+            # capture-window boundaries.
+            signatures["S3_approx"] = window_boundaries is None
+            signatures["S3_bridge_match"] = "address-only-representative"
+            signatures["S3_bridge_ptrs_matched"] = bridge_ptrs_matched
+            signatures["S3_bridge_ptrs_total"] = len(
+                {
+                    int(b["storage_data_ptr"])
+                    for b in bridges
+                    if b.get("storage_data_ptr") is not None
+                }
+            )
+            signatures["S3_bridge_allocs_flagged"] = bridge_allocs_flagged
+        shown = (
+            allocs
+            if include_default_pool
+            else [a for a in allocs if _is_graph_pool(a.pool_id)]
+        )
+        # Peak is scoped to the set being reported (graph pool by default).
+        peak, peak_at = _peak_live_bytes(shown, end)
+        bars = [
+            {
+                "addr": a.addr,
+                "size": a.size,
+                "alloc_ord": a.alloc_ord,
+                "free_ord": a.free_ord,
+                "span": a.span,
+                "never_freed": a.never_freed,
+                "pool_id": a.pool_id,
+                "label": a.label,
+                "flags": a.flags,
+            }
+            for a in sorted(shown, key=lambda x: x.alloc_ord)
+        ]
+        features_used += ["capture_order_lifetime", "gantt", "signatures"]
+        gantt_available = True
+    else:
+        # AC-1.1 / AC-9 negative: no allocation event stream -> degrade. Do not
+        # fabricate lifetimes or a Gantt; report layout + a coexistence proxy.
+        allocs, end = [], 0
+        signatures = {
+            "S1_lingering": False,
+            "S2_pool_bloating": False,
+            "S3_non_reusable": False,
+            "S3_approx": True,
+        }
+        bars = []
+        peak = sum(
+            s["active_bytes"]
+            for s in seg_summaries
+            if include_default_pool or s["is_graph_pool"]
+        )
+        peak_at = 0
+        features_skipped += [
+            "capture_order_lifetime (no device_traces history)",
+            "gantt (no device_traces history)",
+            "signatures (no device_traces history)",
+        ]
+        gantt_available = False
+
     sig_counts: Dict[str, int] = {}
     for b in bars:
         for fl in b["flags"]:
             sig_counts[fl] = sig_counts.get(fl, 0) + 1
+
+    if not lifetime_available:
+        cross = "unavailable (no allocation history)"
+    elif bridges:
+        cross = (
+            f"approximate (address-only representative match of {bridges_matched} "
+            "bridge storages; event-window matching pending Round 2)"
+        )
+    elif window_boundaries is not None:
+        cross = "precise (capture-window boundaries provided)"
+    else:
+        cross = "approximate (no capture-window boundaries)"
+
     return {
         "schema_fingerprint": snap.schema_fingerprint,
         "field_availability": snap.field_availability,
+        "availability_source": avail_source,
+        "layout_available": layout_available,
+        "lifetime_available": lifetime_available,
+        "gantt_available": gantt_available,
+        "features_used": features_used,
+        "features_skipped": features_skipped,
         "event_count": end,
         "graph_pool_ids": graph_pools,
         "segments": seg_summaries,
@@ -351,15 +457,7 @@ def analyze(
         "bars": bars,
         "lifetime_axis": "capture_order_event_ordinal",
         "bridges_matched": bridges_matched,
-        "cross_graph_signature": (
-            f"precise via {bridges_matched} weak-ref bridge tensor(s)"
-            if bridges
-            else (
-                "approximate (no capture-window boundaries)"
-                if window_boundaries is None
-                else "precise (capture-window boundaries provided)"
-            )
-        ),
+        "cross_graph_signature": cross,
     }
 
 
@@ -397,9 +495,39 @@ def _bar_color(flags: List[str]) -> str:
     return "#4c78a8"
 
 
+def _degraded_html(result: dict, title: str) -> str:
+    """Layout-only page shown when the Gantt is unavailable (no allocation history)."""
+    skipped = "; ".join(result.get("features_skipped", [])) or "n/a"
+    seg_rows = "".join(
+        f"<tr><td>{html.escape(str(s['pool_id']))}</td>"
+        f"<td>{'graph' if s['is_graph_pool'] else 'default'}</td>"
+        f"<td>{_mib(s['total_size'])}</td><td>{_mib(s['active_bytes'])}</td>"
+        f"<td>{_mib(s['inactive_bytes'])}</td><td>{_mib(s['largest_free_hole'])}</td>"
+        f"<td>{s['fragmentation'] * 100:.1f}%</td><td>{_mib(s['padding_waste'])}</td></tr>"
+        for s in result["segments"]
+    )
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>body{{font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:20px;color:#222}}
+table{{border-collapse:collapse;margin:8px 0}} td,th{{border:1px solid #ddd;padding:3px 8px;text-align:right}}
+th{{background:#f4f4f4}} td:first-child,th:first-child{{text-align:left}}
+.warn{{background:#fff3cd;border:1px solid #ffe69c;padding:10px;border-radius:4px}}</style></head><body>
+<h1>{html.escape(title)}</h1>
+<p class="warn"><b>Gantt unavailable</b> — this snapshot has no allocation history
+(<code>device_traces</code>), so per-tensor capture-order lifetimes cannot be
+reconstructed (CUDA graph replay performs no allocations). Showing segment layout
+and a coexistence proxy only. Skipped features: {html.escape(skipped)}.</p>
+<p>Coexistence (active graph-pool bytes): <b>{_mib(result['peak_live_bytes'])}</b>.
+Re-capture with <code>_record_memory_history</code> enabled to get the Gantt.</p>
+<table><tr><th>pool_id</th><th>kind</th><th>total</th><th>active</th><th>inactive</th>
+<th>largest hole</th><th>frag</th><th>padding</th></tr>{seg_rows}</table>
+</body></html>"""
+
+
 def to_html(
     result: dict, title: str = "CUDA Graph Pool Tensor Lifetimes", max_rows: int = 500
 ) -> str:
+    if not result.get("gantt_available", True):
+        return _degraded_html(result, title)
     end = max(result["event_count"], 1)
     row_h = 20
     # Render flagged + largest allocations first; cap rows so the page stays
@@ -622,6 +750,12 @@ def main() -> int:
         default=500,
         help="max Gantt bars to render (flagged + largest first)",
     )
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="capability manifest from validator.py (default: sibling capability_manifest.json). "
+        "Gates layout/lifetime/Gantt; absent fields fail closed or degrade.",
+    )
     args = parser.parse_args()
 
     try:
@@ -642,9 +776,31 @@ def main() -> int:
                 f"WARNING: could not read bridges sidecar {side}: {e}", file=sys.stderr
             )
 
-    result = analyze(
-        snap, include_default_pool=args.include_default_pool, bridges=bridges
+    manifest = None
+    manifest_path = args.manifest or os.path.join(
+        os.path.dirname(os.path.abspath(args.snapshot)), "capability_manifest.json"
     )
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            print(f"loaded capability manifest from {manifest_path}")
+        except Exception as e:
+            print(
+                f"WARNING: could not read manifest {manifest_path}: {e}",
+                file=sys.stderr,
+            )
+
+    try:
+        result = analyze(
+            snap,
+            include_default_pool=args.include_default_pool,
+            bridges=bridges,
+            manifest=manifest,
+        )
+    except SchemaError as e:
+        print(f"LAYOUT FAILS CLOSED: {e}", file=sys.stderr)
+        return 3
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.snapshot))
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.snapshot))[0]
@@ -660,16 +816,28 @@ def main() -> int:
 
     sig = result["signatures_present"]
     print(
+        f"availability={result['availability_source']} "
+        f"layout={result['layout_available']} lifetime={result['lifetime_available']} "
+        f"gantt={result['gantt_available']}"
+    )
+    if result["features_skipped"]:
+        print(f"features skipped: {result['features_skipped']}")
+    print(
         f"analyzed {result['num_allocations_total']} allocations "
         f"({result['num_allocations_shown']} in graph pools); "
         f"peak live {_mib(result['peak_live_bytes'])}"
     )
     print(f"graph pools: {result['graph_pool_ids']}")
-    print(
-        f"signatures: lingering={sig.get('S1_lingering')} "
-        f"pool_bloating={sig.get('S2_pool_bloating')} "
-        f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
-    )
+    if result["gantt_available"]:
+        print(
+            f"signatures: lingering={sig.get('S1_lingering')} "
+            f"pool_bloating={sig.get('S2_pool_bloating')} "
+            f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
+        )
+    else:
+        print(
+            "Gantt/lifetime DISABLED (no allocation history) — degraded layout-only report."
+        )
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     print(f"Perfetto (load at https://ui.perfetto.dev): {perfetto_path}")

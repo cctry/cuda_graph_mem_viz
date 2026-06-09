@@ -14,10 +14,10 @@ from __future__ import annotations
 import sys
 
 try:
-    from .analyzer import analyze, to_perfetto
+    from .analyzer import analyze, to_html, to_perfetto
     from .schema import SchemaError, normalize
 except ImportError:  # run directly by path
-    from analyzer import analyze, to_perfetto
+    from analyzer import analyze, to_html, to_perfetto
     from schema import SchemaError, normalize
 
 MiB = 1024 * 1024
@@ -204,11 +204,22 @@ def run() -> int:
     bres = analyze(normalize(_build_raw()), bridges=bridges)
     if bres["bridges_matched"] != 1:
         failures.append(f"expected 1 bridge matched, got {bres['bridges_matched']}")
-    if bres["signatures_present"].get("S3_approx"):
-        failures.append("bridges should make S3 precise (S3_approx False)")
+    # Honest labeling: address-only representative matching is NOT precise; S3 must
+    # stay approximate (no window boundaries) and declare the match method.
+    if not bres["signatures_present"].get("S3_approx"):
+        failures.append(
+            "address-only bridge match must report S3_approx=True (not precise)"
+        )
+    if (
+        bres["signatures_present"].get("S3_bridge_match")
+        != "address-only-representative"
+    ):
+        failures.append(
+            "bridge match method should be labeled address-only-representative"
+        )
     huge2 = next((b for b in bres["bars"] if "huge_kv" in b["label"]), None)
     if huge2 is None or "S3_non_reusable" not in huge2["flags"]:
-        failures.append("bridge-backed huge_kv should carry precise S3_non_reusable")
+        failures.append("bridge-backed huge_kv should carry S3_non_reusable")
     if huge2 is not None and "bridge" not in huge2["label"]:
         failures.append("bridge-backed alloc label should mention bridge")
 
@@ -228,6 +239,67 @@ def run() -> int:
         failures.append("perfetto: missing track (process_name) metadata")
     if not all("ts" in e for e in begins):
         failures.append("perfetto: slice begin events must carry a ts")
+
+    # AC-2: a normal report carries per-block layout for graph-pool segments.
+    gp_seg = next((s for s in result["segments"] if s["is_graph_pool"]), None)
+    if not gp_seg or not gp_seg.get("blocks"):
+        failures.append(
+            "AC-2: graph-pool segment must include per-block layout (blocks[])"
+        )
+    else:
+        blk = gp_seg["blocks"][0]
+        for k in ("address", "offset", "size", "state"):
+            if k not in blk:
+                failures.append(f"AC-2: block layout missing '{k}'")
+    if not result.get("layout_available"):
+        failures.append("AC-2: layout_available should be True for a normal snapshot")
+    if "per_block_layout" not in result.get("features_used", []):
+        failures.append("AC-2: per_block_layout should be in features_used")
+
+    # AC-2: a block lacking an explicit address must FAIL CLOSED (no placeholder).
+    raw_noaddr = _build_raw()
+    del raw_noaddr["segments"][0]["blocks"][0]["address"]
+    try:
+        analyze(normalize(raw_noaddr))
+        failures.append("AC-2: missing block address must fail closed (SchemaError)")
+    except SchemaError:
+        pass
+
+    # AC-1.1: absent allocation history -> degrade (no lifetime/Gantt, no fabrication).
+    raw_nohist = _build_raw()
+    raw_nohist["device_traces"] = []
+    dres = analyze(normalize(raw_nohist))
+    if dres.get("lifetime_available") or dres.get("gantt_available"):
+        failures.append("AC-1.1: absent history must disable lifetime + Gantt")
+    if dres["bars"]:
+        failures.append("AC-1.1: degraded report must not fabricate bars")
+    if "per_block_layout" not in dres.get("features_used", []):
+        failures.append("AC-1.1: layout should remain available when history is absent")
+    if any(
+        dres["signatures_present"].get(k)
+        for k in ("S1_lingering", "S2_pool_bloating", "S3_non_reusable")
+    ):
+        failures.append("AC-1.1: no signatures should be flagged without history")
+    if "Gantt unavailable" not in to_html(dres):
+        failures.append("AC-1.1: degraded HTML must state the Gantt is unavailable")
+
+    # AC-1.1: a manifest marking history absent overrides a snapshot that has events.
+    manifest_nohist = {
+        "capabilities": {
+            "block_explicit_address": {"proven": True},
+            "device_traces_present": {"proven": False},
+            "device_traces_action": {"proven": False},
+        }
+    }
+    mres = analyze(normalize(_build_raw()), manifest=manifest_nohist)
+    if mres.get("lifetime_available"):
+        failures.append(
+            "AC-1.1: manifest history=absent must disable lifetime even with events"
+        )
+    if mres.get("availability_source") != "manifest":
+        failures.append(
+            "AC-1.1: availability_source should be 'manifest' when manifest given"
+        )
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

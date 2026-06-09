@@ -45,7 +45,7 @@ class Frame:
 
 @dataclass
 class Block:
-    address: int
+    address: Optional[int]  # None when the snapshot omits an explicit address
     size: int
     requested_size: Optional[int]
     state: str
@@ -65,14 +65,16 @@ class Segment:
     segment_type: Optional[str]
     blocks: List[Block]
 
-    def block_offsets(self) -> List[Tuple[int, "Block"]]:
-        """(offset_within_segment, block) using explicit address or running sum."""
-        out: List[Tuple[int, Block]] = []
-        running = 0
+    def block_offsets(self) -> List[Tuple[Optional[int], "Block"]]:
+        """(offset_within_segment, block) from the block's explicit address.
+
+        Returns offset=None when the block has no explicit address — callers must
+        treat that as "layout unavailable" rather than fabricating a placeholder.
+        """
+        out: List[Tuple[Optional[int], Block]] = []
         for b in self.blocks:
-            off = (b.address - self.address) if b.address >= 0 else running
+            off = (b.address - self.address) if b.address is not None else None
             out.append((off, b))
-            running += b.size
         return out
 
     def contains(self, addr: int) -> bool:
@@ -146,7 +148,7 @@ def normalize(raw: Dict[str, Any]) -> NormalizedSnapshot:
             addr = b.get("address")
             blocks.append(
                 Block(
-                    address=int(addr) if addr is not None else -1,
+                    address=int(addr) if addr is not None else None,
                     size=int(b["size"]),
                     requested_size=(
                         int(b["requested_size"])
@@ -201,7 +203,9 @@ def normalize(raw: Dict[str, Any]) -> NormalizedSnapshot:
 
     availability = {
         "segment_pool_id": any(s.pool_id is not None for s in segments),
-        "block_address": any(b.address >= 0 for s in segments for b in s.blocks),
+        # True only when EVERY block has an explicit address (layout is trustworthy).
+        "block_address": bool(segments)
+        and all(b.address is not None for s in segments for b in s.blocks),
         "block_requested_size": any(
             b.requested_size is not None for s in segments for b in s.blocks
         ),
