@@ -1788,6 +1788,41 @@ def run() -> int:
             )
         shim_mod._reset_accumulators()
 
+    # Round-12 AC-4/AC-7 (shim): concurrent ranks write rank-safe, non-clobbering
+    # artifacts. Exercises the runtime manifest path directly (no GPU): two ranks
+    # with distinct rank/pid produce distinct stems and both persist in one manifest;
+    # re-upserting the same stem replaces in place (no duplicate, no clobber).
+    import os as _os3
+    import tempfile as _tf3
+
+    shim_mod._reset_accumulators()
+    with _tf3.TemporaryDirectory() as _tm:
+
+        def _stem(rk, pid):
+            return f"cgmem_rank{rk}_world2_localNA_pid{pid}_standard"
+
+        s0, s1 = _stem(0, 111), _stem(1, 222)
+        shim_mod._upsert_manifest(_tm, s0, "standard", 0, 2, "NA", 111)
+        shim_mod._upsert_manifest(_tm, s1, "standard", 1, 2, "NA", 222)
+        shim_mod._upsert_manifest(_tm, s0, "standard", 0, 2, "NA", 111)  # idempotent
+        _man = __import__("json").load(
+            open(_os3.path.join(_tm, "artifact_manifest.json"))
+        )
+        _arts = _man.get("artifacts") or []
+        if len(_arts) != 2:
+            failures.append(
+                f"AC-4: two ranks must yield 2 non-clobbering manifest entries, got {len(_arts)}"
+            )
+        if s0 == s1 or len({a["stem"] for a in _arts}) != 2:
+            failures.append(
+                "AC-4: per-rank artifact stems must be distinct (rank-safe)"
+            )
+        if len({a["pickle"] for a in _arts}) != 2:
+            failures.append("AC-4: per-rank pickle filenames must not clobber")
+        if {str(a["rank"]) for a in _arts} != {"0", "1"}:
+            failures.append("AC-4: manifest must retain both ranks")
+    shim_mod._reset_accumulators()
+
     # Round-5 AC-7: --artifact-dir picks rank 0 and never merges ranks.
     import json as _j
     import os as _os2
