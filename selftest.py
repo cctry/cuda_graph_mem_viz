@@ -1625,6 +1625,93 @@ def run() -> int:
     elif a1_over[0].get("pool_total_bytes") != 10 * MiB:
         failures.append("AC-10: oversized finding must carry its own pool_total_bytes")
 
+    # Round-10 AC-9: ordinary one-window allocations produce NO findings and render
+    # grey (no finding metadata); the visualization/summary is finding-derived.
+    ow_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 1 * MiB,
+                        "requested_size": 1 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [
+            _ev(
+                [
+                    ("alloc", GP, 1 * MiB, "x0"),  # ord0
+                    ("alloc", GP + 8 * MiB, 1 * MiB, "x1"),  # ord1
+                    ("free_requested", GP, 0, None),  # ord2
+                    ("free_requested", GP + 8 * MiB, 0, None),  # ord3
+                ]
+            )
+        ],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    owr = analyze(
+        normalize(ow_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "bridges": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "capture_windows": [_std_win(1, 0, 4, "w")],
+        },
+    )
+    if owr.get("findings"):
+        failures.append(
+            "AC-9: ordinary one-window allocations must produce no findings"
+        )
+    if owr.get("signature_counts"):
+        failures.append(
+            "AC-9: signature_counts must be finding-derived (empty when no findings)"
+        )
+    ow_sl = [e for e in to_perfetto(owr)["traceEvents"] if e.get("ph") == "X"]
+    if any(e.get("cname") != "grey" for e in ow_sl):
+        failures.append(
+            "AC-9: no-finding slices must render grey (not legacy-flag colored)"
+        )
+    if any("finding_ids" in e["args"] or "detectors" in e["args"] for e in ow_sl):
+        failures.append("AC-9: no-finding slices must carry no finding metadata keys")
+
+    # Round-10 AC-9: a segment-only non_reusable finding must update the summary
+    # state (S3_non_reusable True; cross_graph_signature not "none").
+    if not sres["signatures_present"].get("S3_non_reusable"):
+        failures.append(
+            "AC-9: a segment-kind non_reusable finding must set signatures_present.S3_non_reusable"
+        )
+    if sres["cross_graph_signature"].startswith("none"):
+        failures.append(
+            "AC-9: a segment-kind non_reusable finding must not summarize cross-graph as 'none'"
+        )
+    if "segment=" not in sres["cross_graph_signature"]:
+        failures.append(
+            "AC-9: cross_graph_signature must report the segment-kind count"
+        )
+
+    # Round-10 AC-9: a flagged allocation is colored by its strongest detector.
+    seg_pf = [
+        e
+        for e in to_perfetto(sres)["traceEvents"]
+        if e.get("ph") == "X" and e["args"]["addr"] == hex(GP)
+    ]
+    if not seg_pf or any(e.get("cname") == "grey" for e in seg_pf):
+        failures.append(
+            "AC-9: a flagged allocation must be color-highlighted by its detector (not grey)"
+        )
+
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
     try:

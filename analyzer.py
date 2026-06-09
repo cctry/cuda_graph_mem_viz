@@ -1223,29 +1223,47 @@ def analyze(
         ]
         gantt_available = False
 
-    sig_counts: Dict[str, int] = {}
+    # Visualization + user-visible summaries are finding-derived (AC-9). The legacy
+    # S1/S2/S3 flags are retained only as a named compatibility/debug field.
+    legacy_flag_counts: Dict[str, int] = {}
     for b in bars:
         for fl in b["flags"]:
-            sig_counts[fl] = sig_counts.get(fl, 0) + 1
+            legacy_flag_counts[fl] = legacy_flag_counts.get(fl, 0) + 1
+    finding_counts: Dict[str, int] = {}
+    for f in findings:
+        finding_counts[f["detector"]] = finding_counts.get(f["detector"], 0) + 1
+    sig_counts = dict(finding_counts)  # signature_counts is finding-derived
 
-    n_precise = signatures.get("S3_precise_allocs", 0) if lifetime_available else 0
-    n_approx = signatures.get("S3_approx_allocs", 0) if lifetime_available else 0
-    spanning = signatures.get("S3_window_spanning", 0) if lifetime_available else 0
+    nr = [f for f in findings if f["detector"] == "non_reusable_across_graphs"]
+    if nr:
+        # A non-reusable finding (incl. segment-kind) must flip the summary state, so
+        # it can never coexist with a "none" cross-graph summary.
+        signatures["S3_non_reusable"] = True
     if not lifetime_available:
         cross = "unavailable (no allocation history)"
-    elif not signatures.get("S3_non_reusable"):
-        cross = "none (no cross-graph non-reusable allocations found)"
-    elif not signatures.get("S3_approx"):
+    elif nr:
+        kinds: Dict[object, int] = {}
+        bridge_only = 0
+        for f in nr:
+            k = f.get("window_overlap_kind")
+            kinds[k] = kinds.get(k, 0) + 1
+            if f["evidence"] == "bridge_event_ord":
+                bridge_only += 1
         cross = (
-            f"precise ({n_precise} non-reusable allocations; "
-            f"{signatures.get('S3_bridge_precise_allocs', 0)} event-windowed bridges, "
-            f"{spanning} window-spanning)"
+            f"non-reusable: {len(nr)} (capture={kinds.get('capture', 0)}, "
+            f"segment={kinds.get('segment', 0)}, "
+            f"capture+segment={kinds.get('capture_and_segment', 0)}, "
+            f"bridge-only={bridge_only})"
+        )
+    elif signatures.get("S3_approx") and any(
+        "S3_non_reusable_approx" in b["flags"] for b in bars
+    ):
+        cross = (
+            "approximate (no sidecar windows; never-freed allocations held across "
+            "capture — re-capture with the shim for precise window/bridge evidence)"
         )
     else:
-        cross = (
-            f"approximate/mixed ({n_precise} precise, {n_approx} approximate "
-            "non-reusable allocations)"
-        )
+        cross = "none (no non-reusable allocations found)"
 
     return {
         "schema_fingerprint": snap.schema_fingerprint,
@@ -1274,6 +1292,8 @@ def analyze(
         "num_allocations_total": len(allocs),
         "num_allocations_shown": len(bars),
         "signature_counts": sig_counts,
+        "finding_counts": finding_counts if lifetime_available else {},
+        "legacy_flag_counts": legacy_flag_counts,
         "bars": bars,
         "findings": findings,
         "finding_count": len(findings),
@@ -1310,34 +1330,37 @@ def analyze(
 # HTML Gantt rendering (self-contained, no external assets).
 # --------------------------------------------------------------------------- #
 
-_FLAG_COLOR = {
-    "S2_pool_bloating": "#d62728",
-    "S3_non_reusable": "#9467bd",
-    "S3_non_reusable_approx": "#9467bd",
-    "S1_lingering": "#ff7f0e",
+# HTML bar colours + labels are keyed by AC-10 detector (findings are the source of
+# truth for the visualization; the legacy S1/S2/S3 flags are debug-only).
+_DETECTOR_HEX = {
+    "oversized_capture_allocation": "#d62728",  # red
+    "non_reusable_across_graphs": "#9467bd",  # purple
+    "long_lived_outlier": "#ff7f0e",  # orange
 }
-_FLAG_LABEL = {
-    "S2_pool_bloating": "pool-bloating (huge)",
-    "S3_non_reusable": "non-reusable across graphs",
-    "S3_non_reusable_approx": "non-reusable across graphs (approx)",
-    "S1_lingering": "lingering (long-lived)",
+_DETECTOR_HTML_LABEL = {
+    "oversized_capture_allocation": "oversized (pool-bloating)",
+    "non_reusable_across_graphs": "non-reusable across graphs/segments",
+    "long_lived_outlier": "long-lived (lingering)",
 }
+_NORMAL_HEX = "#4c78a8"
 
 
 def _mib(n: int) -> str:
     return f"{n / (1024 * 1024):.2f} MiB"
 
 
-def _bar_color(flags: List[str]) -> str:
-    for key in (
-        "S2_pool_bloating",
-        "S3_non_reusable",
-        "S3_non_reusable_approx",
-        "S1_lingering",
-    ):
-        if key in flags:
-            return _FLAG_COLOR[key]
-    return "#4c78a8"
+def _bar_detector(bar: dict) -> Optional[str]:
+    """Strongest matching detector for a bar, or None when it has no finding."""
+    dets = bar.get("finding_detectors") or []
+    for d in _DETECTOR_PRECEDENCE:
+        if d in dets:
+            return d
+    return None
+
+
+def _bar_color(bar: dict) -> str:
+    d = _bar_detector(bar)
+    return _DETECTOR_HEX[d] if d else _NORMAL_HEX
 
 
 def _degraded_html(result: dict, title: str) -> str:
@@ -1379,9 +1402,10 @@ def to_html(
     # usable on real captures (tens of thousands of allocations). Never silent:
     # the omitted count is shown and the full per-bar data lives in the JSON.
     all_bars = result["bars"]
-    selected = sorted(all_bars, key=lambda b: (0 if b["flags"] else 1, -b["size"]))[
-        :max_rows
-    ]
+    # Findings drive ordering (flagged first) and colour, not the legacy flags.
+    selected = sorted(
+        all_bars, key=lambda b: (0 if b.get("finding_ids") else 1, -b["size"])
+    )[:max_rows]
     omitted = len(all_bars) - len(selected)
     selected = sorted(selected, key=lambda b: b["alloc_ord"])
 
@@ -1389,17 +1413,16 @@ def to_html(
     for i, b in enumerate(selected):
         left = 100.0 * b["alloc_ord"] / end
         width = max(0.4, 100.0 * (b["free_ord"] - b["alloc_ord"]) / end)
-        color = _bar_color(b["flags"])
-        flagtxt = ", ".join(_FLAG_LABEL.get(f, f) for f in b["flags"]) or "ok"
-        find_txt = ""
-        if b.get("finding_detectors"):
-            find_txt = (
-                f" | findings: {', '.join(b['finding_detectors'])}"
-                f" (impact {b.get('finding_impact', 0)})"
-            )
+        color = _bar_color(b)
+        dets = b.get("finding_detectors") or []
+        findtxt = ", ".join(_DETECTOR_HTML_LABEL.get(d, d) for d in dets) or "ok"
+        find_extra = (
+            f" (impact {b.get('finding_impact', 0)})" if b.get("finding_ids") else ""
+        )
         tip = html.escape(
             f"{b['label']} | {_mib(b['size'])} | ord {b['alloc_ord']}->"
-            f"{'END' if b['never_freed'] else b['free_ord']} | pool {b['pool_id']} | {flagtxt}{find_txt}"
+            f"{'END' if b['never_freed'] else b['free_ord']} | pool {b['pool_id']} | "
+            f"{findtxt}{find_extra}"
         )
         lbl = html.escape(f"{_mib(b['size'])}  {b['label']}")
         rows.append(
@@ -1420,15 +1443,11 @@ def to_html(
         for s in result["segments"]
     )
     legend = "".join(
-        f'<span class="leg"><span class="sw" style="background:{c}"></span>{html.escape(_FLAG_LABEL[k])}</span>'
-        for k, c in [
-            ("S2_pool_bloating", _FLAG_COLOR["S2_pool_bloating"]),
-            ("S3_non_reusable", _FLAG_COLOR["S3_non_reusable"]),
-            ("S1_lingering", _FLAG_COLOR["S1_lingering"]),
-        ]
+        f'<span class="leg"><span class="sw" style="background:{_DETECTOR_HEX[k]}"></span>'
+        f"{html.escape(_DETECTOR_HTML_LABEL[k])}</span>"
+        for k in _DETECTOR_PRECEDENCE
     )
-    sig = result["signatures_present"]
-    sc = result.get("signature_counts", {})
+    fc = result.get("finding_counts", {})
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>
 body{{font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;margin:20px;color:#222}}
@@ -1448,11 +1467,10 @@ Cross-graph signature: <b>{html.escape(result['cross_graph_signature'])}</b>.
 Peak live: <b>{_mib(result['peak_live_bytes'])}</b> @ ord {result['peak_live_at_ordinal']}.
 Graph-pool allocations: {result['num_allocations_shown']} (of {result['num_allocations_total']} total).
 Rendering {len(selected)} bars (flagged + largest first); <b>{omitted}</b> omitted &mdash; full data in the JSON.</div>
-<div class="meta">Signatures &mdash; lingering: <b>{sc.get('S1_lingering', 0)}</b>,
-pool-bloating: <b>{sc.get('S2_pool_bloating', 0)}</b>,
-non-reusable (precise bridges): <b>{sc.get('S3_non_reusable', 0)}</b>,
-non-reusable (approx): <b>{sc.get('S3_non_reusable_approx', 0)}</b>
-&mdash; cross-graph source: {html.escape(result['cross_graph_signature'])}.</div>
+<div class="meta">Findings &mdash; oversized: <b>{fc.get('oversized_capture_allocation', 0)}</b>,
+non-reusable: <b>{fc.get('non_reusable_across_graphs', 0)}</b>,
+long-lived: <b>{fc.get('long_lived_outlier', 0)}</b>
+&mdash; cross-graph: {html.escape(result['cross_graph_signature'])}.</div>
 <div>{legend}</div>
 <table><tr><th>pool_id</th><th>kind</th><th>total</th><th>active</th><th>inactive</th>
 <th>largest hole</th><th>frag</th><th>padding</th></tr>{seg_rows}</table>
@@ -1465,33 +1483,19 @@ non-reusable (approx): <b>{sc.get('S3_non_reusable_approx', 0)}</b>
 # Perfetto / Chrome trace export (load at ui.perfetto.dev or any Perfetto).
 # --------------------------------------------------------------------------- #
 
-# (signature flag key, Perfetto reserved color name). First match wins; the bar
-# colour makes the three inefficiency signatures visually distinct in the map.
-_PERFETTO_SIG_COLORS = [
-    ("S2_pool_bloating", "terrible"),  # oversized (red)
-    ("S3_non_reusable", "olive"),  # non-reusable across graphs
-    ("S3_non_reusable_approx", "olive"),
-    ("S1_lingering", "bad"),  # lingering (orange)
-]
 _PERFETTO_NORMAL_COLOR = "grey"
 _PERFETTO_MAX_BANDS = 12  # fallback time bands when no capture windows exist
 
 
-def _perfetto_cname(flags: List[str]) -> str:
-    for key, cname in _PERFETTO_SIG_COLORS:
-        if key in flags:
-            return cname
-    return _PERFETTO_NORMAL_COLOR
-
-
 def _slice_cname(bar: dict) -> str:
-    """Color a slice by its strongest matching detector (most severe first), so
-    AC-10 findings drive the highlight; fall back to the raw signature flags."""
+    """Color a slice by its strongest matching detector (most severe first) — AC-10
+    findings are the source of truth. A slice with no finding renders normal/grey
+    (the legacy S1/S2/S3 flags never drive the visualization)."""
     dets = bar.get("finding_detectors") or []
     for d in _DETECTOR_PRECEDENCE:
         if d in dets:
             return _DETECTOR_CNAME[d]
-    return _perfetto_cname(bar["flags"])
+    return _PERFETTO_NORMAL_COLOR
 
 
 def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
@@ -1727,7 +1731,6 @@ def _run_one(
     with open(perfetto_path, "w") as f:
         json.dump(to_perfetto(result), f, default=str)
 
-    sig = result["signatures_present"]
     print(
         f"[{base}] rank={result.get('rank')} world={result.get('world')} "
         f"availability={result['availability_source']} layout={result['layout_available']} "
@@ -1740,15 +1743,7 @@ def _run_one(
         f"piecewise={len(rep.get('piecewise') or [])}"
     )
     if result["gantt_available"]:
-        print(
-            f"signatures: lingering={sig.get('S1_lingering')} "
-            f"pool_bloating={sig.get('S2_pool_bloating')} "
-            f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
-        )
-        print(f"cross-graph: {result['cross_graph_signature']}")
-        fcount: Dict[str, int] = {}
-        for fdg in result.get("findings") or []:
-            fcount[fdg["detector"]] = fcount.get(fdg["detector"], 0) + 1
+        fcount = result.get("finding_counts") or {}
         top = result.get("findings") or []
         print(
             f"findings: {result.get('finding_count', 0)} "
@@ -1761,6 +1756,7 @@ def _run_one(
                 else ""
             )
         )
+        print(f"cross-graph: {result['cross_graph_signature']}")
     else:
         print("Gantt/lifetime DISABLED (degraded layout-only report).")
     print(f"JSON: {json_path}  HTML: {html_path}  Perfetto: {perfetto_path}")
