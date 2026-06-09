@@ -27,7 +27,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .schema import Frame, NormalizedSnapshot, SchemaError, Segment, load
+try:
+    from .schema import Frame, NormalizedSnapshot, SchemaError, Segment, load
+except ImportError:  # run directly by path (script dir is on sys.path)
+    from schema import Frame, NormalizedSnapshot, SchemaError, Segment, load
 
 DEFAULT_POOL_IDS = (None, (0, 0))
 

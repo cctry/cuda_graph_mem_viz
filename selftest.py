@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import sys
 
-from .analyzer import analyze, to_perfetto
-from .schema import SchemaError, normalize
+try:
+    from .analyzer import analyze, to_perfetto
+    from .schema import SchemaError, normalize
+except ImportError:  # run directly by path
+    from analyzer import analyze, to_perfetto
+    from schema import SchemaError, normalize
 
 MiB = 1024 * 1024
 GP = 0x100000000  # graph-pool segment base
