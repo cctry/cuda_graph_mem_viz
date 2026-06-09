@@ -16,9 +16,11 @@ import sys
 try:
     from .analyzer import analyze, to_html, to_perfetto
     from .schema import SchemaError, normalize
+    from .shim import _window_key
 except ImportError:  # run directly by path
     from analyzer import analyze, to_html, to_perfetto
     from schema import SchemaError, normalize
+    from shim import _window_key
 
 MiB = 1024 * 1024
 GP = 0x100000000  # graph-pool segment base
@@ -517,6 +519,147 @@ def run() -> int:
         )
     if (wres.get("sidecar_meta") or {}).get("schema_version") != 1:
         failures.append("AC-5: sidecar schema_version must be surfaced in sidecar_meta")
+
+    # Round-4: precision must be evidence-based (no zero-evidence "precise").
+    # (a) ordinal bridge with NO matching allocation -> no S3, not "precise".
+    nm = analyze(
+        normalize(reuse_raw),
+        sidecar={
+            **sidecar,
+            "graph_slots": [],
+            "bridges": [
+                {
+                    "storage_data_ptr": P,
+                    "from_segment": 0,
+                    "to_segment": 1,
+                    "event_ord": 999,
+                    "name": "b.nomatch",
+                }
+            ],
+        },
+    )
+    if nm["signatures_present"].get("S3_non_reusable"):
+        failures.append(
+            "AC-5: ordinal bridge with no matching allocation must not flag S3"
+        )
+    if not nm["cross_graph_signature"].startswith("none"):
+        failures.append(
+            "AC-5: zero-evidence cross-graph must be reported as 'none ...'"
+        )
+
+    # (b) a single window covering everything -> no spanning, no stray approx bar.
+    ow = analyze(
+        normalize(reuse_raw),
+        sidecar={
+            **sidecar,
+            "graph_slots": [],
+            "bridges": [],
+            "capture_windows": [
+                {
+                    "runner": "breakable",
+                    "axis": "num_tokens",
+                    "value": 8,
+                    "stream_idx": None,
+                    "begin_ord": 0,
+                    "end_ord": 99,
+                    "window_key": "k",
+                }
+            ],
+        },
+    )
+    if ow["signatures_present"].get("S3_non_reusable"):
+        failures.append("AC-5: a single non-spanning window must not flag S3")
+    if any("S3_non_reusable_approx" in b["flags"] for b in ow["bars"]):
+        failures.append(
+            "AC-5: precise-capable sidecar must suppress the approx never-freed flag"
+        )
+
+    # (c) mixed ordinal + non-ordinal bridges -> precise AND approx -> S3_approx True.
+    mx = analyze(
+        normalize(reuse_raw),
+        sidecar={
+            **sidecar,
+            "graph_slots": [],
+            "bridges": [
+                {
+                    "storage_data_ptr": P,
+                    "from_segment": 0,
+                    "to_segment": 1,
+                    "event_ord": 0,
+                    "name": "b.precise",
+                },
+                {
+                    "storage_data_ptr": GP + 20 * MiB,
+                    "from_segment": 1,
+                    "to_segment": 2,
+                    "name": "b.approx",
+                },
+            ],
+        },
+    )
+    sg = mx["signatures_present"]
+    if not (sg.get("S3_precise_allocs", 0) >= 1 and sg.get("S3_approx_allocs", 0) >= 1):
+        failures.append(
+            f"AC-5: mixed bridges need both precise+approx ({sg.get('S3_precise_allocs')},{sg.get('S3_approx_allocs')})"
+        )
+    if not sg.get("S3_approx"):
+        failures.append("AC-5: any approximate S3 bar must keep S3_approx True (mixed)")
+
+    # (d) GraphSlot contained inside a larger allocation -> name attached + 'contained'.
+    cs = analyze(
+        normalize(reuse_raw),
+        sidecar={
+            **sidecar,
+            "bridges": [],
+            "graph_slots": [
+                {
+                    "name": "inside",
+                    "storage_data_ptr": P + 1024,
+                    "nbytes": 4096,
+                    "shape": [1],
+                    "dtype": "torch.int8",
+                }
+            ],
+        },
+    )
+    inside = next(
+        (lb for lb in cs["graph_slot_labels"] if lb["name"] == "inside"), None
+    )
+    if (
+        inside is None
+        or inside.get("source") != "snapshot-backed"
+        or inside.get("confidence") != "contained"
+    ):
+        failures.append(
+            "AC-5: a GraphSlot contained in an allocation must be snapshot-backed/contained"
+        )
+    if not any(b.get("slot_name") == "inside" for b in cs["bars"]):
+        failures.append(
+            "AC-5: a contained GraphSlot name must be attached to the matched bar"
+        )
+
+    # (e) window_key uniqueness across ranks (AC-4 artifact identity).
+    import os as _os
+
+    _r, _w = _os.environ.get("RANK"), _os.environ.get("WORLD_SIZE")
+    try:
+        _os.environ["RANK"], _os.environ["WORLD_SIZE"] = "0", "2"
+        k0 = _window_key("breakable", "num_tokens", 8, segment_idx=1)
+        _os.environ["RANK"] = "1"
+        k1 = _window_key("breakable", "num_tokens", 8, segment_idx=1)
+        if k0 == k1:
+            failures.append("AC-4: window_key must differ across ranks (no clobber)")
+    finally:
+        (
+            _os.environ.pop("RANK", None)
+            if _r is None
+            else _os.environ.__setitem__("RANK", _r)
+        )
+        (
+            _os.environ.pop("WORLD_SIZE", None)
+            if _w is None
+            else _os.environ.__setitem__("WORLD_SIZE", _w)
+        )
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

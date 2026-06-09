@@ -23,9 +23,15 @@ uv run --no-sync python personal/shiyang/cg_mem_inspect/launch.py \
     --cuda-graph-bs 1 2 4          # keep capture fast; optional
 ```
 
-Outputs (per rank): `artifacts/cgmem_rank{R}_world{W}_local{L}_pid{P}_{standard|breakable}_all.pickle`
-plus a `.bridges.json` sidecar (weak-ref bridge tensors). Capture happens during
-startup warmup; once the `[cg_mem_inspect] dumped ...` line appears you can stop the server.
+Outputs (per rank + runner): `artifacts/cgmem_rank{R}_world{W}_local{L}_pid{P}_{standard|breakable|piecewise}.pickle`
+plus a `.sidecar.json` (capture/segment windows with allocator-event ordinals,
+GraphSlot map, and weak-ref bridges) and an `artifact_manifest.json` indexing
+every artifact by `window_key`. Capture happens during startup warmup; once the
+`[cg_mem_inspect] dumped ...` line appears you can stop the server.
+
+For precise cross-segment bridge matching, the shim reads the allocator event
+count at each boundary via `_snapshot()` (O(n) per call), so **profile a small
+shape set** (e.g. `--cuda-graph-bs 1 --piecewise-cuda-graph-tokens 4 8 16`).
 
 Override output dir / history cap with env: `CG_MEM_INSPECT_OUTDIR`, `CG_MEM_INSPECT_MAX_ENTRIES`.
 
@@ -35,16 +41,23 @@ Override output dir / history cap with env: `CG_MEM_INSPECT_OUTDIR`, `CG_MEM_INS
 ## 2. Analyze
 
 ```bash
-uv run --no-sync python -m personal.shiyang.cg_mem_inspect.analyzer \
-    artifacts/cgmem_..._breakable_all.pickle
+uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
+    artifacts/cgmem_..._breakable.pickle
 ```
 
-Auto-loads the sibling `.bridges.json` and emits three outputs next to the pickle:
-- `*.analysis.json` — full per-allocation + per-segment data (layout, fragmentation, lifetimes, signatures)
+Auto-loads the sibling `.sidecar.json` (and `capability_manifest.json`) and emits
+three outputs next to the pickle:
+- `*.analysis.json` — per-allocation + per-segment data (layout, fragmentation,
+  lifetimes, signatures, `graph_slot_labels` with provenance, `sidecar_meta`)
 - `*.gantt.html` — self-contained HTML Gantt (capped to flagged + largest bars)
 - `*.perfetto.json` — Chrome trace for the Perfetto web UI
 
-Useful flags: `--include-default-pool`, `--max-rows N` (HTML), `--bridges <path>`, `--out-dir <dir>`.
+Cross-graph (non-reusable) S3 is reported **precise** only with real evidence
+(an event-windowed bridge match, or an allocation spanning >1 capture window);
+otherwise it is `approximate`/`mixed`, and `none` when nothing qualifies.
+
+Useful flags: `--include-default-pool`, `--max-rows N` (HTML), `--sidecar <path>`,
+`--manifest <path>`, `--out-dir <dir>`.
 
 ## 3. View the Gantt
 

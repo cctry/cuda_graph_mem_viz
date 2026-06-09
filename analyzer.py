@@ -199,6 +199,7 @@ def _flag_signatures(
     s2_size_pctile: float,
     s2_pool_fraction: float,
     s1_span_pctile: float,
+    skip_approx_s3: bool = False,
 ) -> Dict[str, bool]:
     graph_allocs = [a for a in allocs if _is_graph_pool(a.pool_id)]
     sizes = [a.size for a in graph_allocs]
@@ -233,9 +234,12 @@ def _flag_signatures(
             spans = sum(1 for b in window_boundaries if a.alloc_ord < b < a.free_ord)
             if spans >= 1:
                 a.flags.append("S3_non_reusable")
+                a.bridge_conf = "precise-boundary"
                 used["S3_non_reusable"] = True
-        else:
-            # Approx: never freed during capture => held across all later graphs.
+        elif not skip_approx_s3:
+            # Approx fallback (no precise sidecar evidence): a never-freed alloc is
+            # held across all later graphs. Suppressed when precise sidecar data
+            # (event-ord bridges / capture windows) supplies S3 instead.
             if a.never_freed:
                 a.flags.append("S3_non_reusable_approx")
                 used["S3_non_reusable"] = True
@@ -259,79 +263,91 @@ def _bridges_have_ordinals(bridges: List[dict]) -> bool:
     )
 
 
-def _apply_bridges(
-    allocs: List[Allocation], bridges: List[dict]
-) -> Tuple[bool, int, int]:
+def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> dict:
     """Attribute weak-ref bridge tensors to the allocation they actually back.
 
-    Precise mode (bridge records carry an allocator ``event_ord``): a bridge is
-    joined to the allocation whose address range contains the bridge storage AND
-    whose lifetime ``[alloc_ord, free_ord)`` contains the bridge ``event_ord``.
-    This disambiguates address reuse across capture windows.
+    Bridge records are split by evidence quality:
+      * ordinal-backed (have ``event_ord``) are joined PRECISELY — only to the
+        allocation whose address range contains the bridge storage AND whose
+        lifetime ``[alloc_ord, free_ord)`` contains ``event_ord`` (disambiguates
+        address reuse). An ordinal bridge with no matching allocation is dropped
+        (it produces no precise claim).
+      * non-ordinal are joined APPROXIMATELY — one representative allocation per
+        unique bridge address (never-freed > longest span > largest).
 
-    Approximate fallback (no ``event_ord``): one representative allocation per
-    unique bridge address (never-freed > longest span > largest). Reported as
-    approximate, never precise.
-
-    Returns (precise, allocations_flagged, unique_bridge_ptrs_matched).
+    Returns {"precise": n_precise_allocs, "approx": n_approx_allocs,
+             "ptrs": unique_ptrs_matched_precisely}.
     """
+    import bisect
     from collections import defaultdict
 
-    if _bridges_have_ordinals(bridges):
-        by_addr: Dict[int, List[Allocation]] = defaultdict(list)
-        for a in allocs:
-            by_addr[a.addr].append(a)
-        flagged: set = set()
-        matched: set = set()
-        for b in bridges:
-            p, e = b.get("storage_data_ptr"), b.get("event_ord")
-            if p is None or e is None:
-                continue
-            p, e = int(p), int(e)
-            hit = next(
-                (a for a in by_addr.get(p, []) if a.alloc_ord <= e < a.free_ord), None
-            )
-            if hit is None:  # containment fallback (rare; storage != block base)
-                hit = next(
-                    (
-                        a
-                        for a in allocs
-                        if a.addr <= p < a.addr + a.size
-                        and a.alloc_ord <= e < a.free_ord
-                    ),
-                    None,
-                )
-            if hit is None:
-                continue
-            matched.add(p)
-            if id(hit) not in flagged:
-                _flag_bridge(hit, b, "precise")
-                flagged.add(id(hit))
-        return True, len(flagged), len(matched)
+    ordinal = [
+        b
+        for b in bridges
+        if b.get("event_ord") is not None and int(b.get("event_ord", -1)) >= 0
+    ]
+    plain = [
+        b
+        for b in bridges
+        if not (b.get("event_ord") is not None and int(b.get("event_ord", -1)) >= 0)
+    ]
 
-    # Approximate: representative per unique bridge address.
-    import bisect
-
-    by_ptr: Dict[int, dict] = {}
-    for b in bridges:
-        p = b.get("storage_data_ptr")
-        if p is not None:
-            by_ptr[int(p)] = b
-    ptr_list = sorted(by_ptr)
-    candidates: Dict[int, List[Allocation]] = defaultdict(list)
+    by_addr: Dict[int, List[Allocation]] = defaultdict(list)
     for a in allocs:
-        lo = bisect.bisect_left(ptr_list, a.addr)
-        hi = bisect.bisect_left(ptr_list, a.addr + a.size)
-        for p in ptr_list[lo:hi]:
-            candidates[p].append(a)
-    flagged_repr: set = set()
-    for p, cands in candidates.items():
-        best = max(cands, key=lambda a: (a.never_freed, a.span, a.size))
-        if id(best) in flagged_repr:
+        by_addr[a.addr].append(a)
+
+    precise_flagged: set = set()
+    matched_ptrs: set = set()
+    for b in ordinal:
+        p = b.get("storage_data_ptr")
+        if p is None:
             continue
-        _flag_bridge(best, by_ptr[p], "approximate")
-        flagged_repr.add(id(best))
-    return False, len(flagged_repr), len(candidates)
+        p, e = int(p), int(b["event_ord"])
+        hit = next(
+            (a for a in by_addr.get(p, []) if a.alloc_ord <= e < a.free_ord), None
+        )
+        if hit is None:  # containment fallback (storage may sit inside a block)
+            hit = next(
+                (
+                    a
+                    for a in allocs
+                    if a.addr <= p < a.addr + a.size and a.alloc_ord <= e < a.free_ord
+                ),
+                None,
+            )
+        if hit is None:
+            continue
+        matched_ptrs.add(p)
+        if id(hit) not in precise_flagged:
+            _flag_bridge(hit, b, "precise")
+            precise_flagged.add(id(hit))
+
+    approx_flagged: set = set()
+    if plain:
+        by_ptr: Dict[int, dict] = {}
+        for b in plain:
+            p = b.get("storage_data_ptr")
+            if p is not None:
+                by_ptr[int(p)] = b
+        ptr_list = sorted(by_ptr)
+        candidates: Dict[int, List[Allocation]] = defaultdict(list)
+        for a in allocs:
+            lo = bisect.bisect_left(ptr_list, a.addr)
+            hi = bisect.bisect_left(ptr_list, a.addr + a.size)
+            for p in ptr_list[lo:hi]:
+                candidates[p].append(a)
+        for p, cands in candidates.items():
+            best = max(cands, key=lambda a: (a.never_freed, a.span, a.size))
+            if id(best) in precise_flagged or id(best) in approx_flagged:
+                continue
+            _flag_bridge(best, by_ptr[p], "approximate")
+            approx_flagged.add(id(best))
+
+    return {
+        "precise": len(precise_flagged),
+        "approx": len(approx_flagged),
+        "ptrs": len(matched_ptrs),
+    }
 
 
 def _apply_graph_slots(
@@ -343,11 +359,7 @@ def _apply_graph_slots(
     allocation (event) or block (layout); ``sidecar-only`` when the buffer is
     absent from the snapshot entirely (e.g. allocated before recording started).
     """
-    from collections import defaultdict
-
-    by_addr: Dict[int, List[Allocation]] = defaultdict(list)
-    for a in allocs:
-        by_addr[a.addr].append(a)
+    ordered = sorted(allocs, key=lambda a: a.addr)
     block_ranges = [
         (b.address, b.address + b.size)
         for s in snap.segments
@@ -360,19 +372,47 @@ def _apply_graph_slots(
         if p is None:
             continue
         p = int(p)
-        in_event = by_addr.get(p)
-        in_block = any(lo <= p < hi for lo, hi in block_ranges)
-        source = "snapshot-backed" if (in_event or in_block) else "sidecar-only"
-        if in_event:
-            for a in in_event:
-                a.slot_name = slot.get("name")
+        base = {
+            "name": slot.get("name"),
+            "storage_data_ptr": p,
+            "nbytes": slot.get("nbytes"),
+            "dtype": slot.get("dtype"),
+            "window_key": slot.get("window_key"),
+        }
+        # 1) contained in an allocation event -> attach the name to that bar.
+        hit = next((a for a in ordered if a.addr <= p < a.addr + a.size), None)
+        if hit is not None:
+            hit.slot_name = slot.get("name")
+            labels.append(
+                {
+                    **base,
+                    "source": "snapshot-backed",
+                    "confidence": "exact" if hit.addr == p else "contained",
+                    "matched_addr": hit.addr,
+                    "matched_alloc_ord": hit.alloc_ord,
+                    "matched_free_ord": hit.free_ord,
+                }
+            )
+            continue
+        # 2) contained in a snapshot block (static buffer not in the event stream).
+        blk = next(((lo, hi) for lo, hi in block_ranges if lo <= p < hi), None)
+        if blk is not None:
+            labels.append(
+                {
+                    **base,
+                    "source": "snapshot-backed",
+                    "confidence": "exact" if blk[0] == p else "contained",
+                    "matched_block_address": blk[0],
+                }
+            )
+            continue
+        # 3) absent from the snapshot entirely.
         labels.append(
             {
-                "name": slot.get("name"),
-                "storage_data_ptr": p,
-                "nbytes": slot.get("nbytes"),
-                "dtype": slot.get("dtype"),
-                "source": source,
+                **base,
+                "source": "sidecar-only",
+                "confidence": "sidecar-only",
+                "reason": "not_found_in_snapshot",
             }
         )
     return labels
@@ -487,10 +527,14 @@ def analyze(
 
     lifetime_available = history_ok
     bridges_matched = 0
-    bridge_precise = False
     graph_slot_labels: List[dict] = []
     if lifetime_available:
         allocs, end = _extract_allocations(snap)
+        has_ord = _bridges_have_ordinals(eff_bridges) if eff_bridges else False
+        # Suppress the never-freed approx heuristic when precise sidecar evidence
+        # (event-ord bridges / capture windows) is available — and no legacy
+        # window_boundaries hook is in use.
+        skip_approx = (window_boundaries is None) and (has_ord or bool(capture_windows))
         signatures = _flag_signatures(
             allocs,
             seg_summaries,
@@ -498,11 +542,14 @@ def analyze(
             s2_size_pctile,
             s2_pool_fraction,
             s1_span_pctile,
+            skip_approx_s3=skip_approx,
         )
-        bridge_precise, bridge_allocs_flagged, bridge_ptrs_matched = (
-            _apply_bridges(allocs, eff_bridges) if eff_bridges else (False, 0, 0)
+        bres = (
+            _apply_bridges(allocs, eff_bridges)
+            if eff_bridges
+            else {"precise": 0, "approx": 0, "ptrs": 0}
         )
-        bridges_matched = bridge_ptrs_matched
+        bridges_matched = bres["precise"] + bres["approx"]
 
         # Precise cross-graph from sidecar capture windows: an allocation whose
         # lifetime overlaps more than one capture window cannot be reused by
@@ -527,22 +574,32 @@ def analyze(
                         a.bridge_conf = "precise-window"
                     window_spanning += 1
 
-        if eff_bridges:
-            signatures["S3_non_reusable"] = (
-                signatures.get("S3_non_reusable", False) or bridge_allocs_flagged > 0
-            )
-            signatures["S3_bridge_match"] = (
-                "event-windowed" if bridge_precise else "address-only-representative"
-            )
-            signatures["S3_bridge_ptrs_matched"] = bridge_ptrs_matched
-            signatures["S3_bridge_allocs_flagged"] = bridge_allocs_flagged
+        # Evidence-based S3 state: classify every graph-pool allocation by the
+        # ACTUAL evidence on it. S3 is precise only if no approximate bar remains.
+        graph_allocs = [a for a in allocs if _is_graph_pool(a.pool_id)]
+        precise_bars = [
+            a
+            for a in graph_allocs
+            if "S3_non_reusable" in a.flags
+            and (a.bridge_conf or "").startswith("precise")
+        ]
+        approx_bars = [
+            a
+            for a in graph_allocs
+            if "S3_non_reusable_approx" in a.flags or a.bridge_conf == "approximate"
+        ]
+        signatures["S3_non_reusable"] = bool(precise_bars) or bool(approx_bars)
+        signatures["S3_approx"] = bool(approx_bars)
+        signatures["S3_precise_allocs"] = len(precise_bars)
+        signatures["S3_approx_allocs"] = len(approx_bars)
         signatures["S3_window_spanning"] = window_spanning
-        # Cross-graph is precise when matched by event-windowed bridges or by
-        # capture-window overlap; otherwise it stays approximate.
-        precise_cross = (
-            bridge_precise or bool(capture_windows) or (window_boundaries is not None)
-        )
-        signatures["S3_approx"] = not precise_cross
+        if eff_bridges:
+            signatures["S3_bridge_match"] = (
+                "event-windowed" if has_ord else "address-only-representative"
+            )
+            signatures["S3_bridge_precise_allocs"] = bres["precise"]
+            signatures["S3_bridge_approx_allocs"] = bres["approx"]
+            signatures["S3_bridge_ptrs_matched"] = bres["ptrs"]
 
         graph_slot_labels = _apply_graph_slots(snap, allocs, graph_slots)
 
@@ -614,25 +671,24 @@ def analyze(
         for fl in b["flags"]:
             sig_counts[fl] = sig_counts.get(fl, 0) + 1
 
+    n_precise = signatures.get("S3_precise_allocs", 0) if lifetime_available else 0
+    n_approx = signatures.get("S3_approx_allocs", 0) if lifetime_available else 0
     spanning = signatures.get("S3_window_spanning", 0) if lifetime_available else 0
     if not lifetime_available:
         cross = "unavailable (no allocation history)"
-    elif bridge_precise:
-        extra = f", {spanning} window-spanning" if capture_windows else ""
-        cross = f"precise (event-windowed match of {bridges_matched} bridge storages{extra})"
-    elif capture_windows:
+    elif not signatures.get("S3_non_reusable"):
+        cross = "none (no cross-graph non-reusable allocations found)"
+    elif not signatures.get("S3_approx"):
         cross = (
-            f"precise (capture-window overlap: {spanning} allocations span >1 window)"
+            f"precise ({n_precise} non-reusable allocations; "
+            f"{signatures.get('S3_bridge_precise_allocs', 0)} event-windowed bridges, "
+            f"{spanning} window-spanning)"
         )
-    elif eff_bridges:
-        cross = (
-            f"approximate (address-only representative match of {bridges_matched} "
-            "bridge storages; sidecar has no event ordinals)"
-        )
-    elif window_boundaries is not None:
-        cross = "precise (capture-window boundaries provided)"
     else:
-        cross = "approximate (no capture-window boundaries)"
+        cross = (
+            f"approximate/mixed ({n_precise} precise, {n_approx} approximate "
+            "non-reusable allocations)"
+        )
 
     return {
         "schema_fingerprint": snap.schema_fingerprint,

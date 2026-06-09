@@ -107,6 +107,17 @@ def _as_int(x):
         return None
 
 
+def _window_key(runner, axis, value, stream_idx=None, segment_idx=None) -> str:
+    """Stable, collision-free identity for one capture window across ranks."""
+    rank, world, local, pid = _rank_world_pid()
+    key = f"r{rank}/w{world}/l{local}/p{pid}/{runner}/{axis}={value}"
+    if stream_idx is not None:
+        key += f"/stream={stream_idx}"
+    if segment_idx is not None:
+        key += f"/seg={segment_idx}"
+    return key
+
+
 def _trace_len() -> int:
     """Current number of recorded allocator events = next event's ordinal.
 
@@ -193,6 +204,39 @@ def _extract_graph_slots(runner) -> None:
     _slots_done = True
 
 
+def _upsert_manifest(out, stem, runner, rank, world, local, pid) -> None:
+    """Add/replace this artifact's entry in artifact_manifest.json (no clobber)."""
+    path = os.path.join(out, "artifact_manifest.json")
+    try:
+        manifest = json.load(open(path)) if os.path.exists(path) else {}
+    except Exception:
+        manifest = {}
+    if not isinstance(manifest, dict) or not isinstance(
+        manifest.get("artifacts"), list
+    ):
+        manifest = {"schema_version": SIDECAR_SCHEMA_VERSION, "artifacts": []}
+    entry = {
+        "stem": stem,
+        "runner": runner,
+        "rank": rank,
+        "world": world,
+        "local_rank": local,
+        "pid": pid,
+        "pickle": stem + ".pickle",
+        "sidecar": stem + ".sidecar.json",
+        "window_keys": [w.get("window_key") for w in _capture_windows],
+        "segment_keys": [w.get("window_key") for w in _segment_windows],
+    }
+    manifest["artifacts"] = [
+        a for a in manifest["artifacts"] if a.get("stem") != stem
+    ] + [entry]
+    try:
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+    except Exception as e:  # pragma: no cover
+        print(f"[cg_mem_inspect] manifest write failed: {e}", file=sys.stderr)
+
+
 def _dump(runner: str) -> None:
     import torch
 
@@ -214,6 +258,7 @@ def _dump(runner: str) -> None:
         "world": world,
         "local_rank": local,
         "pid": pid,
+        "artifact_stem": stem,
         "max_entries": _max_entries(),
         "pool_handle": _pool_handle(),
         "capture_windows": list(_capture_windows),
@@ -227,6 +272,7 @@ def _dump(runner: str) -> None:
             json.dump(sidecar, f, indent=2, default=str)
     except Exception as e:  # pragma: no cover
         print(f"[cg_mem_inspect] sidecar write failed: {e}", file=sys.stderr)
+    _upsert_manifest(out, stem, runner, rank, world, local, pid)
     print(
         f"[cg_mem_inspect] dumped {pkl} (windows={len(_capture_windows)} "
         f"segments={len(_segment_windows)} slots={len(_graph_slots)} "
@@ -280,6 +326,9 @@ def _wrap_per_shape(orig, runner_name: str, axis: str):
                     "stream_idx": stream_idx,
                     "begin_ord": begin,
                     "end_ord": _trace_len(),
+                    "window_key": _window_key(
+                        runner_name, axis, value, stream_idx=stream_idx
+                    ),
                 }
             )
             if token_reset is not None:
@@ -327,6 +376,12 @@ def _wrap_segment_end(orig):
                         "segment_idx": p["segment_idx"],
                         "begin_ord": p["begin_ord"],
                         "end_ord": end,
+                        "window_key": _window_key(
+                            "breakable",
+                            "num_tokens",
+                            p["num_tokens"],
+                            segment_idx=p["segment_idx"],
+                        ),
                     }
                 )
 

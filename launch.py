@@ -10,7 +10,8 @@ Usage (all args after this script are passed straight through to launch_server):
         --served-model-name llama4x --host :: \\
         --enable-breakable-cuda-graph
 
-Snapshots + bridge sidecars are written to CG_MEM_INSPECT_OUTDIR
+Snapshots + sidecars (capture/segment windows, GraphSlot map, bridges) and an
+artifact_manifest.json are written to CG_MEM_INSPECT_OUTDIR
 (default: personal/shiyang/cg_mem_inspect/artifacts).
 """
 
