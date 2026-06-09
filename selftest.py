@@ -1291,7 +1291,8 @@ def run() -> int:
     mmpf_sl = [e for e in mmpf["traceEvents"] if e.get("ph") == "X"]
     persist_pf = [e for e in mmpf_sl if e["args"]["addr"] == hex(GP)]
     if not persist_pf or all(
-        "non_reusable_across_graphs" not in e["args"]["detectors"] for e in persist_pf
+        "non_reusable_across_graphs" not in e["args"].get("detectors", "")
+        for e in persist_pf
     ):
         failures.append(
             "AC-9: a flagged slice must carry its detector metadata in Perfetto"
@@ -1300,15 +1301,329 @@ def run() -> int:
         failures.append(
             "AC-9: a flagged slice must be color-highlighted (not normal grey)"
         )
+    # A flagged slice must also carry spanned-window + threshold-summary args.
+    if persist_pf and any(
+        "spanned_capture_windows" not in e["args"]
+        or "finding_thresholds" not in e["args"]
+        for e in persist_pf
+    ):
+        failures.append(
+            "AC-9: a flagged slice must carry spanned-window + threshold-summary args"
+        )
     t1_pf = [
         e
         for e in mmpf_sl
         if e["args"]["addr"] == hex(GP + 8 * MiB) and e["args"]["alloc_ord"] == 3
     ]
-    if t1_pf and any(e["args"]["detectors"] != "none" for e in t1_pf):
-        failures.append("AC-9: an unflagged slice must not carry finding metadata")
+    if t1_pf and any(
+        ("finding_ids" in e["args"]) or ("detectors" in e["args"]) for e in t1_pf
+    ):
+        failures.append(
+            "AC-9: an unflagged slice must NOT carry any finding metadata keys"
+        )
     if mmpf["metadata"].get("finding_count") is None:
         failures.append("AC-9: Perfetto metadata must include finding_count")
+
+    # Round-9 AC-10: every finding carries spanned capture/segment window counts.
+    for f in rfind:
+        if "spanned_capture_windows" not in f or "spanned_segment_windows" not in f:
+            failures.append("AC-10: every finding must carry spanned window counts")
+            break
+
+    # Round-9 AC-10: segment-window persistence is non_reusable even without a bridge.
+    def _ev(seq):
+        out = []
+        for action, addr, size, name in seq:
+            out.append(
+                {
+                    "action": action,
+                    "addr": addr,
+                    "size": size,
+                    "time_us": len(out) * 10,
+                    "frames": _frame(name) if name else [],
+                }
+            )
+        return out
+
+    seg_dt = _ev(
+        [
+            ("alloc", GP, 8 * MiB, "segA"),  # ord0
+            ("alloc", GP + 16 * MiB, 1 * MiB, "segB"),  # ord1
+            ("free_requested", GP + 16 * MiB, 0, None),  # ord2 (segB within seg0)
+            ("free_requested", GP, 0, None),  # ord3 (segA spans seg0+seg1)
+        ]
+    )
+    seg_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [seg_dt],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    seg_sidecar = {
+        "schema_version": 1,
+        "runner": "breakable",
+        "rank": 0,
+        "world": 1,
+        "bridges": [],
+        "graph_slots": [],
+        "capture_windows": [
+            {
+                "runner": "breakable",
+                "axis": "num_tokens",
+                "value": 8,
+                "stream_idx": None,
+                "begin_ord": 0,
+                "end_ord": 4,
+                "window_key": "cap0",
+            }
+        ],
+        "segment_windows": [
+            {
+                "num_tokens": 8,
+                "segment_idx": 0,
+                "begin_ord": 0,
+                "end_ord": 2,
+                "window_key": "seg0",
+            },
+            {
+                "num_tokens": 8,
+                "segment_idx": 1,
+                "begin_ord": 2,
+                "end_ord": 4,
+                "window_key": "seg1",
+            },
+        ],
+    }
+    sres = analyze(normalize(seg_raw), sidecar=seg_sidecar)
+    sfind = sres.get("findings") or []
+    segA_nr = [
+        f
+        for f in sfind
+        if f["detector"] == "non_reusable_across_graphs" and f["addr"] == GP
+    ]
+    if not segA_nr:
+        failures.append(
+            "AC-10: an allocation spanning 2 segment windows (no bridge) must be non_reusable"
+        )
+    elif segA_nr[0].get("window_overlap_kind") != "segment":
+        failures.append(
+            "AC-10: segment-only persistence must report window_overlap_kind=segment"
+        )
+    if any(
+        f["detector"] == "non_reusable_across_graphs" and f["addr"] == GP + 16 * MiB
+        for f in sfind
+    ):
+        failures.append(
+            "AC-10: an allocation within one segment window must NOT be non_reusable"
+        )
+
+    # Round-9 AC-10: long_lived must NOT flag a one-window allocation; multi-window yes.
+    ll_dt = _ev(
+        [
+            ("alloc", GP, 8 * MiB, "big"),  # ord0 (freed late)
+            ("alloc", GP + 16 * MiB, 1 * MiB, "s0"),  # ord1
+            ("free_requested", GP + 16 * MiB, 0, None),  # ord2
+            ("alloc", GP + 16 * MiB, 1 * MiB, "s1"),  # ord3
+            ("free_requested", GP + 16 * MiB, 0, None),  # ord4
+            ("free_requested", GP, 0, None),  # ord5 (big spans the whole capture)
+        ]
+    )
+    ll_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [ll_dt],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+
+    def _std_win(value, begin, end, key):
+        return {
+            "runner": "standard",
+            "axis": "bs",
+            "value": value,
+            "stream_idx": 0,
+            "begin_ord": begin,
+            "end_ord": end,
+            "window_key": key,
+        }
+
+    ll_one = analyze(
+        normalize(ll_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "bridges": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "capture_windows": [_std_win(1, 0, 6, "w")],
+        },
+    )
+    if any(
+        f["detector"] == "long_lived_outlier" and f["addr"] == GP
+        for f in (ll_one.get("findings") or [])
+    ):
+        failures.append("AC-10: a one-window freed allocation must NOT be long_lived")
+    ll_two = analyze(
+        normalize(ll_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "bridges": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "capture_windows": [_std_win(1, 0, 3, "w0"), _std_win(2, 3, 6, "w1")],
+        },
+    )
+    if not any(
+        f["detector"] == "long_lived_outlier" and f["addr"] == GP
+        for f in (ll_two.get("findings") or [])
+    ):
+        failures.append(
+            "AC-10: a freed allocation spanning 2 windows must be long_lived"
+        )
+
+    # Round-9 AC-10: a single freed allocation (pickle-only) is NOT long_lived.
+    one_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [
+            _ev([("alloc", GP, 8 * MiB, "only"), ("free_requested", GP, 0, None)])
+        ],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    if any(
+        f["detector"] == "long_lived_outlier"
+        for f in (analyze(normalize(one_raw)).get("findings") or [])
+    ):
+        failures.append(
+            "AC-10: a single freed allocation (pickle-only) must NOT be long_lived"
+        )
+
+    # Round-9 AC-10: oversized is per-pool — a 50%-of-its-own-pool allocation is
+    # flagged even when it is not a global size outlier (a separate huge pool exists).
+    GP2 = 0x300000000
+    mp_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 10 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 5 * MiB,
+                        "requested_size": 5 * MiB,
+                        "state": "active_allocated",
+                        "frames": _frame("small_pool_half"),
+                    },
+                    {
+                        "address": GP + 5 * MiB,
+                        "size": 5 * MiB,
+                        "requested_size": 0,
+                        "state": "inactive",
+                        "frames": [],
+                    },
+                ],
+            },
+            {
+                "address": GP2,
+                "total_size": 1000 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 2),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP2,
+                        "size": 900 * MiB,
+                        "requested_size": 900 * MiB,
+                        "state": "active_allocated",
+                        "frames": _frame("big_pool_block"),
+                    },
+                    {
+                        "address": GP2 + 900 * MiB,
+                        "size": 100 * MiB,
+                        "requested_size": 0,
+                        "state": "inactive",
+                        "frames": [],
+                    },
+                ],
+            },
+        ],
+        "device_traces": [
+            _ev(
+                [
+                    ("alloc", GP, 5 * MiB, "small_pool_half"),
+                    ("alloc", GP2, 900 * MiB, "big_pool_block"),
+                ]
+            )
+        ],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    mp_find = analyze(normalize(mp_raw)).get("findings") or []
+    a1_over = [
+        f
+        for f in mp_find
+        if f["detector"] == "oversized_capture_allocation" and f["addr"] == GP
+    ]
+    if not a1_over:
+        failures.append(
+            "AC-10: an allocation that is a large fraction of its OWN pool must be oversized"
+        )
+    elif a1_over[0].get("pool_total_bytes") != 10 * MiB:
+        failures.append("AC-10: oversized finding must carry its own pool_total_bytes")
 
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
