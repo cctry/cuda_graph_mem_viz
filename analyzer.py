@@ -95,7 +95,13 @@ def _extract_allocations(snap: NormalizedSnapshot) -> Tuple[List[Allocation], in
         return None
 
     for ev in snap.events:
+        if ev.addr < 0:
+            # Sentinel address (field missing) — never fabricate an allocation from
+            # it. Lifetime gating should already disable this path; this is defense.
+            continue
         if ev.is_alloc:
+            if ev.size <= 0:
+                continue
             rec = Allocation(
                 addr=ev.addr,
                 size=ev.size,
@@ -136,7 +142,9 @@ def _peak_live_bytes(allocs: List[Allocation], end: int) -> Tuple[int, int]:
     return peak, at
 
 
-def _segment_summaries(snap: NormalizedSnapshot) -> List[dict]:
+def _segment_summaries(
+    snap: NormalizedSnapshot, with_blocks: bool = True
+) -> List[dict]:
     out: List[dict] = []
     for s in snap.segments:
         active = sum(b.size for b in s.blocks if b.is_active)
@@ -149,33 +157,36 @@ def _segment_summaries(snap: NormalizedSnapshot) -> List[dict]:
             and b.size > b.requested_size
         )
         largest_hole = max((b.size for b in s.blocks if not b.is_active), default=0)
-        blocks = [
-            {
-                "address": b.address,
-                "offset": (b.address - s.address) if b.address is not None else None,
-                "size": b.size,
-                "requested_size": b.requested_size,
-                "state": b.state,
-                "label": _user_frame_label(b.frames) if b.frames else None,
-            }
-            for b in s.blocks
-        ]
-        out.append(
-            {
-                "address": s.address,
-                "pool_id": s.pool_id,
-                "is_graph_pool": _is_graph_pool(s.pool_id),
-                "segment_type": s.segment_type,
-                "total_size": s.total_size,
-                "active_bytes": active,
-                "inactive_bytes": inactive,
-                "largest_free_hole": largest_hole,
-                "fragmentation": (inactive / s.total_size) if s.total_size else 0.0,
-                "padding_waste": padding,
-                "num_blocks": len(s.blocks),
-                "blocks": blocks,
-            }
-        )
+        summary = {
+            "address": s.address,
+            "pool_id": s.pool_id,
+            "is_graph_pool": _is_graph_pool(s.pool_id),
+            "segment_type": s.segment_type,
+            "total_size": s.total_size,
+            "active_bytes": active,
+            "inactive_bytes": inactive,
+            "largest_free_hole": largest_hole,
+            "fragmentation": (inactive / s.total_size) if s.total_size else 0.0,
+            "padding_waste": padding,
+            "num_blocks": len(s.blocks),
+        }
+        if with_blocks:
+            # Per-block layout (AC-2) — emitted only when layout is available, i.e.
+            # every block has an explicit address, so offsets are real (no fabrication).
+            summary["blocks"] = [
+                {
+                    "address": b.address,
+                    "offset": (
+                        (b.address - s.address) if b.address is not None else None
+                    ),
+                    "size": b.size,
+                    "requested_size": b.requested_size,
+                    "state": b.state,
+                    "label": _user_frame_label(b.frames) if b.frames else None,
+                }
+                for b in s.blocks
+            ]
+        out.append(summary)
     return out
 
 
@@ -279,25 +290,52 @@ def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> Tuple[int, 
     return len(flagged), len(candidates)
 
 
-def _resolve_availability(
-    snap: NormalizedSnapshot, manifest: Optional[dict]
-) -> Tuple[bool, bool, str]:
-    """Return (block_address_ok, history_ok, source) gating layout & lifetime.
+def _resolve_availability(snap: NormalizedSnapshot, manifest: Optional[dict]) -> dict:
+    """Feature availability = manifest ∩ snapshot.
 
-    A provided capability manifest takes precedence (AC-1.1): if it marks history
-    absent, lifetime/Gantt stay disabled even if the snapshot happens to carry
-    events. Without a manifest, availability is derived from the snapshot itself.
+    The capability manifest is an **upper bound**, never an override: a feature is
+    available only when the manifest allows it (if a manifest is supplied) AND the
+    *analyzed snapshot* actually carries the required fields. This prevents a valid
+    manifest from one run from vouching for a malformed/drifted snapshot.
+
+    Returns a dict with: source, snapshot_block, manifest_block (None if no
+    manifest), block_address (intersection), history (intersection).
     """
+    fa = snap.field_availability
+    snap_block = bool(fa.get("block_address"))
+    snap_hist = (
+        bool(fa.get("device_traces"))
+        and bool(fa.get("trace_action"))
+        and bool(fa.get("trace_addr"))
+        and bool(fa.get("trace_size"))
+    )
     if manifest and isinstance(manifest.get("capabilities"), dict):
         caps = manifest["capabilities"]
 
         def proven(key: str) -> bool:
             return bool(caps.get(key, {}).get("proven", False))
 
-        history = proven("device_traces_present") and proven("device_traces_action")
-        return proven("block_explicit_address"), history, "manifest"
-    fa = snap.field_availability
-    return bool(fa.get("block_address")), bool(fa.get("device_traces")), "snapshot"
+        man_block = proven("block_explicit_address")
+        man_hist = (
+            proven("device_traces_present")
+            and proven("device_traces_action")
+            and proven("device_traces_addr")
+            and proven("device_traces_size")
+        )
+        return {
+            "source": "manifest",
+            "snapshot_block": snap_block,
+            "manifest_block": man_block,
+            "block_address": man_block and snap_block,
+            "history": man_hist and snap_hist,
+        }
+    return {
+        "source": "snapshot",
+        "snapshot_block": snap_block,
+        "manifest_block": None,
+        "block_address": snap_block,
+        "history": snap_hist,
+    }
 
 
 def analyze(
@@ -310,22 +348,32 @@ def analyze(
     s2_pool_fraction: float = 0.10,
     s1_span_pctile: float = 0.75,
 ) -> dict:
-    block_address_ok, history_ok, avail_source = _resolve_availability(snap, manifest)
+    avail = _resolve_availability(snap, manifest)
+    avail_source = avail["source"]
 
-    # AC-2: fail closed when block addresses are missing — never fabricate offsets.
-    # Exception: a manifest that explicitly marks layout unavailable degrades instead.
-    if block_address_ok:
+    # AC-2 layout gating (manifest ∩ snapshot):
+    #  - intersection available           -> layout on.
+    #  - snapshot lacks addresses:
+    #      * manifest explicitly marks it unavailable -> degrade (aggregate only).
+    #      * otherwise (no manifest, or manifest falsely claims proven) -> FAIL CLOSED.
+    #  - snapshot has addresses but manifest disabled layout -> degrade.
+    if avail["block_address"]:
         layout_available = True
-    elif avail_source == "manifest":
-        layout_available = False
+    elif not avail["snapshot_block"]:
+        if avail["manifest_block"] is False:
+            layout_available = False
+        else:
+            raise SchemaError(
+                "block addresses missing from the analyzed snapshot — pickle-only "
+                "layout fails closed (AC-2). A capability manifest cannot vouch for a "
+                "snapshot that lacks block addresses; re-capture with explicit "
+                "addresses or supply a manifest that marks layout unavailable."
+            )
     else:
-        raise SchemaError(
-            "block addresses missing from the snapshot — pickle-only layout fails "
-            "closed (AC-2). Re-capture so every block carries an explicit address, "
-            "or supply a manifest that marks layout unavailable."
-        )
+        layout_available = False
 
-    seg_summaries = _segment_summaries(snap)
+    history_ok = avail["history"]
+    seg_summaries = _segment_summaries(snap, with_blocks=layout_available)
     graph_pools = sorted(
         {s["pool_id"] for s in seg_summaries if s["is_graph_pool"]}, key=str
     )

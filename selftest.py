@@ -301,6 +301,77 @@ def run() -> int:
             "AC-1.1: availability_source should be 'manifest' when manifest given"
         )
 
+    # AC-2 (round 2): a manifest claiming block addresses proven must NOT vouch for
+    # a snapshot that actually lacks them -> fail closed (manifest is an upper bound).
+    raw_missing = _build_raw()
+    del raw_missing["segments"][0]["blocks"][0]["address"]
+    manifest_all_ok = {
+        "capabilities": {
+            "block_explicit_address": {"proven": True},
+            "device_traces_present": {"proven": True},
+            "device_traces_action": {"proven": True},
+            "device_traces_addr": {"proven": True},
+            "device_traces_size": {"proven": True},
+        }
+    }
+    try:
+        analyze(normalize(raw_missing), manifest=manifest_all_ok)
+        failures.append(
+            "AC-2: manifest-proven must not bypass a snapshot missing block addresses (must fail closed)"
+        )
+    except SchemaError:
+        pass
+
+    # AC-2 (round 2): a manifest that marks layout unavailable degrades (no raise),
+    # aggregate-only (no per-block blocks[]).
+    manifest_block_off = {
+        "capabilities": {
+            **manifest_all_ok["capabilities"],
+            "block_explicit_address": {"proven": False},
+        }
+    }
+    ldeg = analyze(normalize(_build_raw()), manifest=manifest_block_off)
+    if ldeg.get("layout_available"):
+        failures.append("AC-2: manifest marking layout unavailable should degrade")
+    if any("blocks" in s for s in ldeg["segments"]):
+        failures.append("AC-2: degraded layout must not emit per-block blocks[]")
+
+    # AC-3 (round 2): manifest denying trace addr disables lifetime even with events.
+    manifest_no_addr = {
+        "capabilities": {
+            **manifest_all_ok["capabilities"],
+            "device_traces_addr": {"proven": False},
+        }
+    }
+    nres = analyze(normalize(_build_raw()), manifest=manifest_no_addr)
+    if nres.get("lifetime_available") or nres.get("gantt_available"):
+        failures.append(
+            "AC-3: manifest device_traces_addr=false must disable lifetime/Gantt"
+        )
+    if nres["bars"]:
+        failures.append("AC-3: no bars when trace addr is denied by manifest")
+
+    # AC-3 (round 2): snapshot-fallback — trace events missing addr -> disabled, no -1 bars.
+    raw_noaddr_tr = _build_raw()
+    for ev in raw_noaddr_tr["device_traces"][0]:
+        ev.pop("addr", None)
+    sres = analyze(normalize(raw_noaddr_tr))
+    if sres.get("lifetime_available") or sres.get("gantt_available"):
+        failures.append("AC-3: snapshot missing trace addr must disable lifetime/Gantt")
+    if any(b["addr"] < 0 for b in sres["bars"]):
+        failures.append("AC-3: must never emit bars at sentinel addr=-1")
+    if sres["bars"]:
+        failures.append("AC-3: no bars when snapshot trace addr is missing")
+
+    # AC-3 (round 2): snapshot-fallback — alloc events missing size -> lifetime disabled.
+    raw_nosize = _build_raw()
+    for ev in raw_nosize["device_traces"][0]:
+        if ev.get("action") == "alloc":
+            ev.pop("size", None)
+    zres = analyze(normalize(raw_nosize))
+    if zres.get("lifetime_available"):
+        failures.append("AC-3: snapshot missing alloc size must disable lifetime")
+
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:
         normalize(

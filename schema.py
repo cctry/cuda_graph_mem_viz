@@ -201,6 +201,21 @@ def normalize(raw: Dict[str, Any]) -> NormalizedSnapshot:
             )
         )
 
+    # Trace-field completeness for the events lifetime analysis actually consumes
+    # (alloc + free). Lifetime/Gantt require real addr/size — never the -1/0
+    # sentinels above — so we track presence in the RAW events here.
+    used_evs = [
+        ev for ev in flat if str(ev.get("action")) in ("alloc",) + _FREE_ACTIONS
+    ]
+    alloc_evs = [ev for ev in flat if str(ev.get("action")) == "alloc"]
+    trace_action_ok = bool(flat) and all("action" in ev for ev in flat)
+    trace_addr_ok = bool(used_evs) and all(
+        ev.get("addr") is not None for ev in used_evs
+    )
+    trace_size_ok = bool(alloc_evs) and all(
+        ev.get("size") is not None for ev in alloc_evs
+    )
+
     availability = {
         "segment_pool_id": any(s.pool_id is not None for s in segments),
         # True only when EVERY block has an explicit address (layout is trustworthy).
@@ -211,6 +226,9 @@ def normalize(raw: Dict[str, Any]) -> NormalizedSnapshot:
         ),
         "block_frames": any(b.frames for s in segments for b in s.blocks),
         "device_traces": bool(events),
+        "trace_action": trace_action_ok,
+        "trace_addr": trace_addr_ok,
+        "trace_size": trace_size_ok,
         "trace_frames": any(ev.frames for ev in events),
         "trace_time_us": any(ev.time_us is not None for ev in events),
         "free_events": any(ev.is_free for ev in events),
