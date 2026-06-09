@@ -24,7 +24,9 @@ import sys
 import urllib.parse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ARTIFACTS = os.path.join(_HERE, "artifacts")
+# Default to ./cg_mem_artifacts in the launch directory (matches launch.py / shim);
+# override with --dir.
+_ARTIFACTS = os.path.join(os.getcwd(), "cg_mem_artifacts")
 
 
 class _CORSHandler(http.server.SimpleHTTPRequestHandler):

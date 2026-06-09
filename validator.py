@@ -281,7 +281,8 @@ def build_manifest(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    default_dir = os.path.join(os.path.dirname(__file__), "artifacts")
+    # Default to ./cg_mem_artifacts in the launch directory (matches launch.py / shim).
+    default_dir = os.path.join(os.getcwd(), "cg_mem_artifacts")
     parser.add_argument("--out-dir", default=default_dir)
     parser.add_argument("--max-entries", type=int, default=200_000)
     args = parser.parse_args()

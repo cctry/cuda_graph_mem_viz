@@ -11,8 +11,6 @@ Run:
 
 from __future__ import annotations
 
-import sys
-
 try:
     from . import shim as shim_mod
     from .analyzer import (
@@ -192,7 +190,6 @@ def run() -> int:
     if not sig.get("S3_approx"):
         failures.append("S3 should be approximate without window boundaries")
 
-    bars = {b["label"].split(" ")[0]: b for b in result["bars"]}
     huge_bar = next((b for b in result["bars"] if "huge_kv" in b["label"]), None)
     scratch_bar = next((b for b in result["bars"] if "scratch" in b["label"]), None)
     if huge_bar is None or "S2_pool_bloating" not in huge_bar["flags"]:
@@ -209,11 +206,6 @@ def run() -> int:
         failures.append(
             f"expected peak 153 MiB, got {result['peak_live_bytes'] / MiB:.1f} MiB"
         )
-
-    # Precise S3 via window boundary between huge's alloc(0) and its end.
-    precise = analyze(snap, window_boundaries=[4])
-    if precise["signatures_present"].get("S3_approx"):
-        failures.append("S3 should be precise when window boundaries are given")
 
     # Bridge matching: a weak-ref bridge whose storage ptr lands inside huge's block.
     bridges = [

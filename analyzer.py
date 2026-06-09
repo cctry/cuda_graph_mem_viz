@@ -195,12 +195,13 @@ def _segment_summaries(
 def _flag_signatures(
     allocs: List[Allocation],
     seg_summaries: List[dict],
-    window_boundaries: Optional[List[int]],
     s2_size_pctile: float,
     s2_pool_fraction: float,
     s1_span_pctile: float,
     skip_approx_s3: bool = False,
 ) -> Dict[str, bool]:
+    """Legacy per-bar S1/S2/S3 heuristic flags (debug only). Precise S3 evidence
+    (capture-window spanning / event-ord bridges) is layered on in ``analyze``."""
     graph_allocs = [a for a in allocs if _is_graph_pool(a.pool_id)]
     sizes = [a.size for a in graph_allocs]
     size_threshold = _pct(sizes, s2_size_pctile)
@@ -214,9 +215,7 @@ def _flag_signatures(
     span_threshold = _pct([float(a.span) for a in freed], s1_span_pctile)
     median_size = _pct(sizes, 0.5)
 
-    approx_s3 = window_boundaries is None
     used = {"S1_lingering": False, "S2_pool_bloating": False, "S3_non_reusable": False}
-
     for a in graph_allocs:
         # S2: abnormally large allocation that bloats the pool.
         ptotal = pool_total.get(a.pool_id, 0)
@@ -229,21 +228,13 @@ def _flag_signatures(
         if not a.never_freed and freed and a.span >= span_threshold and a.span > 0:
             a.flags.append("S1_lingering")
             used["S1_lingering"] = True
-        # S3: occupies a region that cannot be reused across graphs.
-        if window_boundaries is not None:
-            spans = sum(1 for b in window_boundaries if a.alloc_ord < b < a.free_ord)
-            if spans >= 1:
-                a.flags.append("S3_non_reusable")
-                a.bridge_conf = "precise-boundary"
-                used["S3_non_reusable"] = True
-        elif not skip_approx_s3:
-            # Approx fallback (no precise sidecar evidence): a never-freed alloc is
-            # held across all later graphs. Suppressed when precise sidecar data
-            # (event-ord bridges / capture windows) supplies S3 instead.
-            if a.never_freed:
-                a.flags.append("S3_non_reusable_approx")
-                used["S3_non_reusable"] = True
-    used["S3_approx"] = approx_s3
+        # S3 approx fallback: a never-freed alloc is held across all later graphs.
+        # Suppressed when precise sidecar data (event-ord bridges / capture windows)
+        # supplies S3 instead.
+        if not skip_approx_s3 and a.never_freed:
+            a.flags.append("S3_non_reusable_approx")
+            used["S3_non_reusable"] = True
+    used["S3_approx"] = True
     return used
 
 
@@ -982,7 +973,6 @@ def _resolve_availability(snap: NormalizedSnapshot, manifest: Optional[dict]) ->
 def analyze(
     snap: NormalizedSnapshot,
     include_default_pool: bool = False,
-    window_boundaries: Optional[List[int]] = None,
     bridges: Optional[List[dict]] = None,
     sidecar: Optional[dict] = None,
     manifest: Optional[dict] = None,
@@ -1059,13 +1049,11 @@ def analyze(
         allocs, end = _extract_allocations(snap)
         has_ord = _bridges_have_ordinals(eff_bridges) if eff_bridges else False
         # Suppress the never-freed approx heuristic when precise sidecar evidence
-        # (event-ord bridges / capture windows) is available — and no legacy
-        # window_boundaries hook is in use.
-        skip_approx = (window_boundaries is None) and (has_ord or bool(capture_windows))
+        # (event-ord bridges / capture windows) is available.
+        skip_approx = has_ord or bool(capture_windows)
         signatures = _flag_signatures(
             allocs,
             seg_summaries,
-            window_boundaries,
             s2_size_pctile,
             s2_pool_fraction,
             s1_span_pctile,
@@ -1379,17 +1367,22 @@ def _bar_color(bar: dict) -> str:
     return _DETECTOR_HEX[d] if d else _NORMAL_HEX
 
 
-def _degraded_html(result: dict, title: str) -> str:
-    """Layout-only page shown when the Gantt is unavailable (no allocation history)."""
-    skipped = "; ".join(result.get("features_skipped", [])) or "n/a"
-    seg_rows = "".join(
+def _seg_rows_html(segments: List[dict]) -> str:
+    """Per-segment layout table rows (shared by the Gantt + degraded HTML)."""
+    return "".join(
         f"<tr><td>{html.escape(str(s['pool_id']))}</td>"
         f"<td>{'graph' if s['is_graph_pool'] else 'default'}</td>"
         f"<td>{_mib(s['total_size'])}</td><td>{_mib(s['active_bytes'])}</td>"
         f"<td>{_mib(s['inactive_bytes'])}</td><td>{_mib(s['largest_free_hole'])}</td>"
         f"<td>{s['fragmentation'] * 100:.1f}%</td><td>{_mib(s['padding_waste'])}</td></tr>"
-        for s in result["segments"]
+        for s in segments
     )
+
+
+def _degraded_html(result: dict, title: str) -> str:
+    """Layout-only page shown when the Gantt is unavailable (no allocation history)."""
+    skipped = "; ".join(result.get("features_skipped", [])) or "n/a"
+    seg_rows = _seg_rows_html(result["segments"])
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>body{{font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:20px;color:#222}}
 table{{border-collapse:collapse;margin:8px 0}} td,th{{border:1px solid #ddd;padding:3px 8px;text-align:right}}
@@ -1450,14 +1443,7 @@ def to_html(
         )
     track_h = max(len(selected) * row_h, row_h)
 
-    seg_rows = "".join(
-        f"<tr><td>{html.escape(str(s['pool_id']))}</td>"
-        f"<td>{'graph' if s['is_graph_pool'] else 'default'}</td>"
-        f"<td>{_mib(s['total_size'])}</td><td>{_mib(s['active_bytes'])}</td>"
-        f"<td>{_mib(s['inactive_bytes'])}</td><td>{_mib(s['largest_free_hole'])}</td>"
-        f"<td>{s['fragmentation'] * 100:.1f}%</td><td>{_mib(s['padding_waste'])}</td></tr>"
-        for s in result["segments"]
-    )
+    seg_rows = _seg_rows_html(result["segments"])
     legend = "".join(
         f'<span class="leg"><span class="sw" style="background:{_DETECTOR_HEX[k]}"></span>'
         f"{html.escape(_DETECTOR_HTML_LABEL[k])}</span>"

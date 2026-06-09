@@ -12,7 +12,7 @@ Usage (all args after this script are passed straight through to launch_server):
 
 Snapshots + sidecars (capture/segment windows, GraphSlot map, bridges) and an
 artifact_manifest.json are written to CG_MEM_INSPECT_OUTDIR
-(default: personal/shiyang/cg_mem_inspect/artifacts).
+(default: ./cg_mem_artifacts under the directory you launch from).
 """
 
 import os
@@ -27,7 +27,11 @@ def main() -> None:
     env = os.environ.copy()
     env["CG_MEM_INSPECT"] = "1"
     env["CG_MEM_INSPECT_REPO"] = _REPO
-    env.setdefault("CG_MEM_INSPECT_OUTDIR", os.path.join(_HERE, "artifacts"))
+    # Default to ./cg_mem_artifacts in the directory the user launches from (matches
+    # the shim's own default), not the package dir. Override with CG_MEM_INSPECT_OUTDIR.
+    env.setdefault(
+        "CG_MEM_INSPECT_OUTDIR", os.path.join(os.getcwd(), "cg_mem_artifacts")
+    )
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in [_SITEDIR, _REPO, env.get("PYTHONPATH", "")] if p
     )
