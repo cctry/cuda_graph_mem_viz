@@ -14,11 +14,11 @@ from __future__ import annotations
 import sys
 
 try:
-    from .analyzer import analyze, to_html, to_perfetto
+    from .analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
     from .schema import SchemaError, normalize
     from .shim import _window_key
 except ImportError:  # run directly by path
-    from analyzer import analyze, to_html, to_perfetto
+    from analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
     from schema import SchemaError, normalize
     from shim import _window_key
 
@@ -660,6 +660,248 @@ def run() -> int:
             if _w is None
             else _os.environ.__setitem__("WORLD_SIZE", _w)
         )
+
+    # Round-5 AC-6/AC-7: grouped, rank-aware reports from sidecar windows.
+    grp_sidecar = {
+        "schema_version": 1,
+        "runner": "breakable",
+        "rank": 0,
+        "world": 1,
+        "local_rank": "0",
+        "pid": 7,
+        "max_entries": 1000,
+        "pool_handle": "(0, 1)",
+        "capture_windows": [
+            {
+                "runner": "standard",
+                "axis": "bs",
+                "value": 1,
+                "stream_idx": 0,
+                "begin_ord": 0,
+                "end_ord": 2,
+                "window_key": "std/bs1",
+            },
+            {
+                "runner": "piecewise",
+                "axis": "num_tokens",
+                "value": 4,
+                "stream_idx": None,
+                "begin_ord": 2,
+                "end_ord": 4,
+                "window_key": "pw/nt4",
+            },
+        ],
+        "segment_windows": [
+            {
+                "num_tokens": 8,
+                "segment_idx": 0,
+                "begin_ord": 0,
+                "end_ord": 2,
+                "window_key": "brk/nt8/seg0",
+            },
+            {
+                "num_tokens": 8,
+                "segment_idx": 1,
+                "begin_ord": 2,
+                "end_ord": 5,
+                "window_key": "brk/nt8/seg1",
+            },
+        ],
+        "graph_slots": [],
+        "bridges": [],
+    }
+    gr = analyze(normalize(_build_raw()), sidecar=grp_sidecar)
+    reps = gr.get("reports") or {}
+    if len(reps.get("standard") or []) != 1:
+        failures.append("AC-6: expected 1 standard report window")
+    if len(reps.get("piecewise") or []) != 1:
+        failures.append("AC-6: expected 1 piecewise report window")
+    if len(reps.get("breakable") or []) != 2:
+        failures.append("AC-6: expected 2 breakable segment reports")
+    if gr.get("rank") != 0 or gr.get("world") != 1:
+        failures.append("AC-7: top-level rank/world header must be stamped")
+    if reps.get("breakable") and "num_allocations" not in reps["breakable"][0]:
+        failures.append("AC-6: report entries must carry per-window metrics")
+
+    nob = analyze(
+        normalize(_build_raw()),
+        sidecar={
+            **grp_sidecar,
+            "segment_windows": [],
+            "capture_windows": [
+                {
+                    "runner": "breakable",
+                    "axis": "num_tokens",
+                    "value": 8,
+                    "stream_idx": None,
+                    "begin_ord": 0,
+                    "end_ord": 3,
+                    "window_key": "brk/nt8",
+                }
+            ],
+        },
+    )
+    if "NO segment" not in ((nob.get("reports") or {}).get("breakable_note") or ""):
+        failures.append(
+            "AC-6: breakable sidecar without segment windows must be flagged, not monolithic"
+        )
+
+    # Round-5 AC-5: window-keyed GraphSlot must not mislabel a reused address.
+    Q = GP
+    de = []
+
+    def _da(addr, size, name):
+        de.append(
+            {
+                "action": "alloc",
+                "addr": addr,
+                "size": size,
+                "time_us": len(de) * 10,
+                "frames": _frame(name),
+            }
+        )
+
+    def _df(addr):
+        de.append(
+            {
+                "action": "free_requested",
+                "addr": addr,
+                "size": 0,
+                "time_us": len(de) * 10,
+                "frames": [],
+            }
+        )
+
+    _da(Q, 8 * MiB, "winA")  # ord0 (window A [0,2))
+    _df(Q)  # ord1
+    _da(GP + 16 * MiB, 1 * MiB, "x")  # ord2
+    _da(Q, 8 * MiB, "winB")  # ord3 (window B [3,5), reuse of Q)
+    dis_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [de],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    ds = analyze(
+        normalize(dis_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "rank": 0,
+            "world": 1,
+            "bridges": [],
+            "segment_windows": [],
+            "capture_windows": [
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 1,
+                    "stream_idx": 0,
+                    "begin_ord": 0,
+                    "end_ord": 2,
+                    "window_key": "wA",
+                },
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 2,
+                    "stream_idx": 0,
+                    "begin_ord": 3,
+                    "end_ord": 5,
+                    "window_key": "wB",
+                },
+            ],
+            "graph_slots": [
+                {
+                    "name": "slotB",
+                    "storage_data_ptr": Q,
+                    "nbytes": 8 * MiB,
+                    "shape": [1],
+                    "dtype": "torch.int8",
+                    "window_key": "wB",
+                }
+            ],
+        },
+    )
+    winA_bar = next((b for b in ds["bars"] if b["alloc_ord"] == 0), None)
+    winB_bar = next((b for b in ds["bars"] if b["alloc_ord"] == 3), None)
+    if winB_bar is None or winB_bar.get("slot_name") != "slotB":
+        failures.append(
+            "AC-5: window-keyed GraphSlot must label the in-window allocation"
+        )
+    if winA_bar is not None and winA_bar.get("slot_name") == "slotB":
+        failures.append(
+            "AC-5: window-keyed GraphSlot must NOT label a reused address in another window"
+        )
+
+    # Round-5 AC-7: --artifact-dir picks rank 0 and never merges ranks.
+    import json as _j
+    import os as _os2
+    import pickle as _pk
+    import tempfile as _tf
+    import types as _types
+
+    with _tf.TemporaryDirectory() as _td:
+        for _rk in (0, 1):
+            with open(_os2.path.join(_td, f"art_rank{_rk}.pickle"), "wb") as _f:
+                _pk.dump(_build_raw(), _f)
+        with open(_os2.path.join(_td, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 2,
+                            "pickle": "art_rank0.pickle",
+                        },
+                        {
+                            "stem": "art_rank1",
+                            "rank": 1,
+                            "world": 2,
+                            "pickle": "art_rank1.pickle",
+                        },
+                    ],
+                },
+                _f,
+            )
+        _args = _types.SimpleNamespace(
+            artifact_dir=_td,
+            rank=None,
+            out_dir=_td,
+            include_default_pool=False,
+            title="t",
+            max_rows=50,
+            bridges=None,
+            sidecar=None,
+            manifest=None,
+        )
+        if _run_artifact_dir(_args) != 0:
+            failures.append("AC-7: --artifact-dir rank-0 run should succeed")
+        if not _os2.path.exists(_os2.path.join(_td, "art_rank0.analysis.json")):
+            failures.append("AC-7: rank-0 artifact should be analyzed")
+        if _os2.path.exists(_os2.path.join(_td, "art_rank1.analysis.json")):
+            failures.append(
+                "AC-7: rank-1 must NOT be analyzed by default (no rank merge)"
+            )
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

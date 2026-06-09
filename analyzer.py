@@ -351,7 +351,10 @@ def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> dict:
 
 
 def _apply_graph_slots(
-    snap: NormalizedSnapshot, allocs: List[Allocation], graph_slots: List[dict]
+    snap: NormalizedSnapshot,
+    allocs: List[Allocation],
+    graph_slots: List[dict],
+    windows_by_key: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> List[dict]:
     """Attach GraphSlot names to allocations and report label provenance.
 
@@ -380,7 +383,17 @@ def _apply_graph_slots(
             "window_key": slot.get("window_key"),
         }
         # 1) contained in an allocation event -> attach the name to that bar.
-        hit = next((a for a in ordered if a.addr <= p < a.addr + a.size), None)
+        # When the slot carries a window_key, only match a bar inside that window
+        # (disambiguates an address reused across capture windows).
+        win = (windows_by_key or {}).get(slot.get("window_key"))
+
+        def _in_window(a, _win=win):
+            return _win is None or (_win[0] <= a.alloc_ord < _win[1])
+
+        hit = next(
+            (a for a in ordered if a.addr <= p < a.addr + a.size and _in_window(a)),
+            None,
+        )
         if hit is not None:
             hit.slot_name = slot.get("name")
             labels.append(
@@ -416,6 +429,74 @@ def _apply_graph_slots(
             }
         )
     return labels
+
+
+def _build_reports(
+    allocs: List[Allocation],
+    capture_windows_raw: List[dict],
+    segment_windows_raw: List[dict],
+) -> dict:
+    """Group graph-pool allocations into per-window reports.
+
+    standard -> keyed by (batch_size, stream_idx) from capture windows;
+    breakable -> keyed by (num_tokens, segment_idx) from segment windows;
+    piecewise -> keyed by num_tokens from capture windows.
+    """
+    graph = [a for a in allocs if _is_graph_pool(a.pool_id)]
+
+    def metrics(begin: int, end: int) -> dict:
+        inwin = [a for a in graph if a.alloc_ord < end and begin < a.free_ord]
+        sigc: Dict[str, int] = {}
+        for a in inwin:
+            for fl in a.flags:
+                sigc[fl] = sigc.get(fl, 0) + 1
+        return {
+            "num_allocations": len(inwin),
+            "total_bytes": sum(a.size for a in inwin),
+            "signature_counts": sigc,
+        }
+
+    reports: Dict[str, object] = {"standard": [], "breakable": [], "piecewise": []}
+    for w in capture_windows_raw:
+        runner = w.get("runner")
+        b, e = w.get("begin_ord"), w.get("end_ord")
+        if runner == "breakable" or runner not in reports or b is None or e is None:
+            continue
+        reports[runner].append(  # type: ignore[union-attr]
+            {
+                "window_key": w.get("window_key"),
+                "value": w.get("value"),
+                "stream_idx": w.get("stream_idx"),
+                "begin_ord": int(b),
+                "end_ord": int(e),
+                **metrics(int(b), int(e)),
+            }
+        )
+    for w in segment_windows_raw:
+        b, e = w.get("begin_ord"), w.get("end_ord")
+        if b is None or e is None:
+            continue
+        reports["breakable"].append(  # type: ignore[union-attr]
+            {
+                "window_key": w.get("window_key"),
+                "num_tokens": w.get("num_tokens"),
+                "segment_idx": w.get("segment_idx"),
+                "begin_ord": int(b),
+                "end_ord": int(e),
+                **metrics(int(b), int(e)),
+            }
+        )
+    breakable_caps = [w for w in capture_windows_raw if w.get("runner") == "breakable"]
+    reports["breakable_note"] = (
+        "grouped by segment_windows"
+        if segment_windows_raw
+        else (
+            "breakable capture windows present but NO segment windows (not grouped)"
+            if breakable_caps
+            else "no breakable windows"
+        )
+    )
+    return reports
 
 
 def _resolve_availability(snap: NormalizedSnapshot, manifest: Optional[dict]) -> dict:
@@ -480,13 +561,24 @@ def analyze(
     sc = sidecar or {}
     eff_bridges = sc.get("bridges") if sc.get("bridges") is not None else bridges
     graph_slots = sc.get("graph_slots") or []
-    capture_windows = [
-        (int(w["begin_ord"]), int(w["end_ord"]))
-        for w in (sc.get("capture_windows") or [])
-        if w.get("begin_ord") is not None
-        and w.get("end_ord") is not None
-        and int(w["begin_ord"]) >= 0
-    ]
+    capture_windows_raw = sc.get("capture_windows") or []
+    segment_windows_raw = sc.get("segment_windows") or []
+
+    def _ord_range(w):
+        b, e = w.get("begin_ord"), w.get("end_ord")
+        if b is None or e is None or int(b) < 0:
+            return None
+        return int(b), int(e)
+
+    # Cross-graph (non-reusable) spanning uses per-graph CAPTURE windows only;
+    # segment windows are intra-graph (used for breakable grouping + AC-10 later),
+    # so mixing them here would flag nearly every allocation.
+    capture_windows = [r for w in capture_windows_raw if (r := _ord_range(w))]
+    windows_by_key = {
+        w["window_key"]: _ord_range(w)
+        for w in (capture_windows_raw + segment_windows_raw)
+        if w.get("window_key") and _ord_range(w)
+    }
 
     avail = _resolve_availability(snap, manifest)
     avail_source = avail["source"]
@@ -528,6 +620,7 @@ def analyze(
     lifetime_available = history_ok
     bridges_matched = 0
     graph_slot_labels: List[dict] = []
+    reports: dict = {"standard": [], "breakable": [], "piecewise": []}
     if lifetime_available:
         allocs, end = _extract_allocations(snap)
         has_ord = _bridges_have_ordinals(eff_bridges) if eff_bridges else False
@@ -601,7 +694,10 @@ def analyze(
             signatures["S3_bridge_approx_allocs"] = bres["approx"]
             signatures["S3_bridge_ptrs_matched"] = bres["ptrs"]
 
-        graph_slot_labels = _apply_graph_slots(snap, allocs, graph_slots)
+        graph_slot_labels = _apply_graph_slots(
+            snap, allocs, graph_slots, windows_by_key
+        )
+        reports = _build_reports(allocs, capture_windows_raw, segment_windows_raw)
 
         shown = (
             allocs
@@ -693,6 +789,15 @@ def analyze(
     return {
         "schema_fingerprint": snap.schema_fingerprint,
         "field_availability": snap.field_availability,
+        # Rank-aware header (from the sidecar) — top-level, not only in sidecar_meta.
+        "rank": sc.get("rank"),
+        "world": sc.get("world"),
+        "local_rank": sc.get("local_rank"),
+        "pid": sc.get("pid"),
+        "runner": sc.get("runner"),
+        "max_entries": sc.get("max_entries"),
+        "pool_handle": sc.get("pool_handle"),
+        "reports": reports,
         "availability_source": avail_source,
         "layout_available": layout_available,
         "lifetime_available": lifetime_available,
@@ -1009,9 +1114,150 @@ def to_perfetto(result: dict) -> dict:
     }
 
 
+def _run_one(
+    snapshot_path: str,
+    args,
+    bridges_override=None,
+    sidecar_override=None,
+    manifest_override=None,
+) -> int:
+    """Analyze a single snapshot pickle (auto-discovering its sibling sidecars)."""
+    try:
+        snap = load(snapshot_path)
+    except SchemaError as e:
+        print(f"SCHEMA ERROR (failing closed): {e}", file=sys.stderr)
+        return 3
+
+    def _load_json(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:  # pragma: no cover
+            print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
+            return None
+
+    stem = os.path.splitext(snapshot_path)[0]
+    dirn = os.path.dirname(os.path.abspath(snapshot_path))
+
+    bridges = None
+    bpath = bridges_override or (stem + ".bridges.json")
+    if os.path.exists(bpath):
+        d = _load_json(bpath)
+        bridges = (d or {}).get("bridges")
+
+    sidecar = None
+    spath = sidecar_override or (stem + ".sidecar.json")
+    if os.path.exists(spath):
+        sidecar = _load_json(spath)
+        if sidecar:
+            print(
+                f"loaded sidecar (windows={len(sidecar.get('capture_windows') or [])}, "
+                f"segments={len(sidecar.get('segment_windows') or [])}, "
+                f"slots={len(sidecar.get('graph_slots') or [])}, "
+                f"bridges={len(sidecar.get('bridges') or [])}) from {spath}"
+            )
+
+    manifest = None
+    mpath = manifest_override or os.path.join(dirn, "capability_manifest.json")
+    if os.path.exists(mpath):
+        manifest = _load_json(mpath)
+
+    try:
+        result = analyze(
+            snap,
+            include_default_pool=args.include_default_pool,
+            bridges=bridges,
+            sidecar=sidecar,
+            manifest=manifest,
+        )
+    except SchemaError as e:
+        print(f"LAYOUT FAILS CLOSED: {e}", file=sys.stderr)
+        return 3
+
+    out_dir = args.out_dir or dirn
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(snapshot_path))[0]
+    json_path = os.path.join(out_dir, f"{base}.analysis.json")
+    html_path = os.path.join(out_dir, f"{base}.gantt.html")
+    perfetto_path = os.path.join(out_dir, f"{base}.perfetto.json")
+    with open(json_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    with open(html_path, "w") as f:
+        f.write(to_html(result, title=args.title, max_rows=args.max_rows))
+    with open(perfetto_path, "w") as f:
+        json.dump(to_perfetto(result), f, default=str)
+
+    sig = result["signatures_present"]
+    print(
+        f"[{base}] rank={result.get('rank')} world={result.get('world')} "
+        f"availability={result['availability_source']} layout={result['layout_available']} "
+        f"lifetime={result['lifetime_available']} gantt={result['gantt_available']}"
+    )
+    rep = result.get("reports") or {}
+    print(
+        f"reports: standard={len(rep.get('standard') or [])} "
+        f"breakable={len(rep.get('breakable') or [])} "
+        f"piecewise={len(rep.get('piecewise') or [])}"
+    )
+    if result["gantt_available"]:
+        print(
+            f"signatures: lingering={sig.get('S1_lingering')} "
+            f"pool_bloating={sig.get('S2_pool_bloating')} "
+            f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
+        )
+        print(f"cross-graph: {result['cross_graph_signature']}")
+    else:
+        print("Gantt/lifetime DISABLED (degraded layout-only report).")
+    print(f"JSON: {json_path}  HTML: {html_path}  Perfetto: {perfetto_path}")
+    return 0
+
+
+def _run_artifact_dir(args) -> int:
+    """Analyze a rank's artifacts from artifact_manifest.json (rank-0 default)."""
+    man_path = os.path.join(args.artifact_dir, "artifact_manifest.json")
+    if not os.path.exists(man_path):
+        print(f"no artifact_manifest.json in {args.artifact_dir}", file=sys.stderr)
+        return 2
+    try:
+        with open(man_path) as f:
+            manifest = json.load(f)
+    except Exception as e:
+        print(f"could not read {man_path}: {e}", file=sys.stderr)
+        return 2
+    arts = manifest.get("artifacts") or []
+    ranks = sorted({str(a.get("rank")) for a in arts})
+    if not ranks:
+        print(f"no artifacts in {man_path}", file=sys.stderr)
+        return 2
+    if args.rank is not None:
+        sel = str(args.rank)
+    else:
+        sel = "0" if "0" in ranks else ranks[0]
+    chosen = [a for a in arts if str(a.get("rank")) == sel]
+    if not chosen:
+        print(f"no artifacts for rank {sel}; available ranks: {ranks}", file=sys.stderr)
+        return 2
+    print(
+        f"artifact-dir: ranks={ranks}; analyzing rank {sel} "
+        f"({len(chosen)} artifact(s)) — ranks are never merged"
+    )
+    rc = 0
+    for a in chosen:
+        pkl = os.path.join(
+            args.artifact_dir, a.get("pickle") or (a.get("stem", "") + ".pickle")
+        )
+        if not os.path.exists(pkl):
+            print(f"WARNING: missing pickle {pkl}", file=sys.stderr)
+            continue
+        rc = _run_one(pkl, args) or rc
+    return rc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("snapshot", help="path to a torch memory snapshot pickle")
+    parser.add_argument(
+        "snapshot", nargs="?", help="snapshot pickle (omit when using --artifact-dir)"
+    )
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--include-default-pool", action="store_true")
     parser.add_argument(
@@ -1038,119 +1284,30 @@ def main() -> int:
         help="capture sidecar from the shim (default: sibling .sidecar.json). Provides "
         "capture/segment windows, GraphSlot map, and event-ord bridges for precise joins.",
     )
+    parser.add_argument(
+        "--artifact-dir",
+        default=None,
+        help="analyze a rank's artifacts from <dir>/artifact_manifest.json (rank-0 default)",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="with --artifact-dir, select this rank instead of rank 0 (never merges ranks)",
+    )
     args = parser.parse_args()
 
-    try:
-        snap = load(args.snapshot)
-    except SchemaError as e:
-        print(f"SCHEMA ERROR (failing closed): {e}", file=sys.stderr)
-        return 3
-
-    bridges = None
-    side = args.bridges or (os.path.splitext(args.snapshot)[0] + ".bridges.json")
-    if os.path.exists(side):
-        try:
-            with open(side) as f:
-                bridges = json.load(f).get("bridges")
-            print(f"loaded {len(bridges or [])} bridge record(s) from {side}")
-        except Exception as e:
-            print(
-                f"WARNING: could not read bridges sidecar {side}: {e}", file=sys.stderr
-            )
-
-    manifest = None
-    manifest_path = args.manifest or os.path.join(
-        os.path.dirname(os.path.abspath(args.snapshot)), "capability_manifest.json"
+    if args.artifact_dir:
+        return _run_artifact_dir(args)
+    if not args.snapshot:
+        parser.error("provide a snapshot path, or use --artifact-dir")
+    return _run_one(
+        args.snapshot,
+        args,
+        bridges_override=args.bridges,
+        sidecar_override=args.sidecar,
+        manifest_override=args.manifest,
     )
-    if os.path.exists(manifest_path):
-        try:
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-            print(f"loaded capability manifest from {manifest_path}")
-        except Exception as e:
-            print(
-                f"WARNING: could not read manifest {manifest_path}: {e}",
-                file=sys.stderr,
-            )
-
-    sidecar = None
-    sidecar_path = args.sidecar or (
-        os.path.splitext(args.snapshot)[0] + ".sidecar.json"
-    )
-    if os.path.exists(sidecar_path):
-        try:
-            with open(sidecar_path) as f:
-                sidecar = json.load(f)
-            print(
-                f"loaded sidecar (schema_version={sidecar.get('schema_version')}, "
-                f"windows={len(sidecar.get('capture_windows') or [])}, "
-                f"segments={len(sidecar.get('segment_windows') or [])}, "
-                f"slots={len(sidecar.get('graph_slots') or [])}, "
-                f"bridges={len(sidecar.get('bridges') or [])}) from {sidecar_path}"
-            )
-        except Exception as e:
-            print(
-                f"WARNING: could not read sidecar {sidecar_path}: {e}", file=sys.stderr
-            )
-
-    try:
-        result = analyze(
-            snap,
-            include_default_pool=args.include_default_pool,
-            bridges=bridges,
-            sidecar=sidecar,
-            manifest=manifest,
-        )
-    except SchemaError as e:
-        print(f"LAYOUT FAILS CLOSED: {e}", file=sys.stderr)
-        return 3
-    out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.snapshot))
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(args.snapshot))[0]
-    json_path = os.path.join(out_dir, f"{base}.analysis.json")
-    html_path = os.path.join(out_dir, f"{base}.gantt.html")
-    with open(json_path, "w") as f:
-        json.dump(result, f, indent=2, default=str)
-    with open(html_path, "w") as f:
-        f.write(to_html(result, title=args.title, max_rows=args.max_rows))
-    perfetto_path = os.path.join(out_dir, f"{base}.perfetto.json")
-    with open(perfetto_path, "w") as f:
-        json.dump(to_perfetto(result), f, default=str)
-
-    sig = result["signatures_present"]
-    print(
-        f"availability={result['availability_source']} "
-        f"layout={result['layout_available']} lifetime={result['lifetime_available']} "
-        f"gantt={result['gantt_available']}"
-    )
-    if result["features_skipped"]:
-        print(f"features skipped: {result['features_skipped']}")
-    print(
-        f"analyzed {result['num_allocations_total']} allocations "
-        f"({result['num_allocations_shown']} in graph pools); "
-        f"peak live {_mib(result['peak_live_bytes'])}"
-    )
-    print(f"graph pools: {result['graph_pool_ids']}")
-    if result["gantt_available"]:
-        print(
-            f"signatures: lingering={sig.get('S1_lingering')} "
-            f"pool_bloating={sig.get('S2_pool_bloating')} "
-            f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
-        )
-        print(f"cross-graph: {result['cross_graph_signature']}")
-        if result.get("graph_slot_labels"):
-            print(
-                f"graph slots: {len(result['graph_slot_labels'])} "
-                f"({result['sidecar_only_label_count']} sidecar-only)"
-            )
-    else:
-        print(
-            "Gantt/lifetime DISABLED (no allocation history) — degraded layout-only report."
-        )
-    print(f"JSON: {json_path}")
-    print(f"HTML: {html_path}")
-    print(f"Perfetto (load at https://ui.perfetto.dev): {perfetto_path}")
-    return 0
 
 
 if __name__ == "__main__":

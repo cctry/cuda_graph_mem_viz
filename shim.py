@@ -52,6 +52,9 @@ _slots_done = False
 _cur_num_tokens: contextvars.ContextVar = contextvars.ContextVar(
     "cg_cur_num_tokens", default=None
 )
+_cur_window_key: contextvars.ContextVar = contextvars.ContextVar(
+    "cg_cur_window_key", default=None
+)
 
 
 def _reset_accumulators() -> None:
@@ -197,6 +200,7 @@ def _extract_graph_slots(runner) -> None:
                     "nbytes": st.nbytes(),
                     "shape": list(buf.shape),
                     "dtype": str(buf.dtype),
+                    "window_key": _cur_window_key.get(),
                 }
             )
         except Exception:
@@ -308,12 +312,14 @@ def _wrap_per_shape(orig, runner_name: str, axis: str):
     def capture_one(self, *args, **kwargs):
         if not enabled():
             return orig(self, *args, **kwargs)
-        _extract_graph_slots(self)
         value = _as_int(args[0]) if args else _as_int(kwargs.get(axis))
         stream_idx = _as_int(kwargs.get("stream_idx"))
         if stream_idx is None and len(args) >= 3:
             stream_idx = _as_int(args[2])
+        wkey = _window_key(runner_name, axis, value, stream_idx=stream_idx)
+        wkey_reset = _cur_window_key.set(wkey)
         token_reset = _cur_num_tokens.set(value) if axis == "num_tokens" else None
+        _extract_graph_slots(self)
         begin = _trace_len()
         try:
             return orig(self, *args, **kwargs)
@@ -326,11 +332,10 @@ def _wrap_per_shape(orig, runner_name: str, axis: str):
                     "stream_idx": stream_idx,
                     "begin_ord": begin,
                     "end_ord": _trace_len(),
-                    "window_key": _window_key(
-                        runner_name, axis, value, stream_idx=stream_idx
-                    ),
+                    "window_key": wkey,
                 }
             )
+            _cur_window_key.reset(wkey_reset)
             if token_reset is not None:
                 _cur_num_tokens.reset(token_reset)
 
