@@ -1921,10 +1921,35 @@ def _baseline_key(rank: str, r: dict) -> str:
     )
 
 
+def _validate_baseline_file(path: str) -> Optional[dict]:
+    """Return a baseline dict if PATH exists, parses, and has the required shape;
+    else print a clear error and return None (so the caller can fail closed)."""
+    if not os.path.exists(path):
+        print(f"BASELINE ERROR: --load-baseline {path} not found", file=sys.stderr)
+        return None
+    base = _load_json(path)
+    if not isinstance(base, dict) or "schema_version" not in base:
+        print(f"BASELINE ERROR: {path} is not a valid baseline JSON", file=sys.stderr)
+        return None
+    rows = base.get("rows")
+    if not isinstance(rows, list) or any(
+        not isinstance(r, dict) or "key" not in r or "high_water_bytes" not in r
+        for r in rows
+    ):
+        print(
+            f"BASELINE ERROR: {path} rows must each carry 'key' + 'high_water_bytes'",
+            file=sys.stderr,
+        )
+        return None
+    return base
+
+
 def _run_compare_ranks(args) -> int:
     """Analyze every rank's artifacts independently and emit a cross-rank comparison
-    (never merged). Optionally save/load a per-variant high-water-mark baseline and
-    fail (nonzero) on a regression beyond the threshold."""
+    (never merged). All-or-nothing fail-closed: every manifest entry's pickle+sidecar
+    must exist, rank 0 must be present, and ``--load-baseline`` (if given) must be a
+    valid baseline — all checked BEFORE any analysis or output. Optionally save/load
+    a per-variant high-water-mark baseline and fail (nonzero) on a regression."""
     man_path = os.path.join(args.artifact_dir, "artifact_manifest.json")
     if not os.path.exists(man_path):
         print(f"no artifact_manifest.json in {args.artifact_dir}", file=sys.stderr)
@@ -1935,11 +1960,9 @@ def _run_compare_ranks(args) -> int:
         print(f"no artifacts in {man_path}", file=sys.stderr)
         return 2
 
-    # rank -> {variant_key: row}; also a per-(rank,artifact) summary.
-    by_rank: Dict[str, Dict[Tuple, dict]] = {}
-    artifact_summaries: List[dict] = []
-    analyzed = 0
-    rc = 0
+    # Preflight: resolve every entry's pickle+sidecar, require rank 0, and validate
+    # the baseline — all before analysis, so we never write partial/unsafe output.
+    resolved = []
     for a in sorted(arts, key=lambda x: (str(x.get("rank")), str(x.get("runner")))):
         rank = str(a.get("rank"))
         stem = a.get("stem", "")
@@ -1948,21 +1971,42 @@ def _run_compare_ranks(args) -> int:
             args.artifact_dir, a.get("sidecar") or (stem + ".sidecar.json")
         )
         if not os.path.exists(pkl):
-            print(f"ERROR: missing pickle {pkl}", file=sys.stderr)
-            rc = rc or 2
-            continue
+            print(
+                f"ERROR: missing pickle {pkl} (compare-ranks aborted)", file=sys.stderr
+            )
+            return 2
         if not os.path.exists(side):
-            print(f"ERROR: missing sidecar {side}", file=sys.stderr)
-            rc = rc or 2
-            continue
+            print(
+                f"ERROR: missing sidecar {side} (compare-ranks aborted)",
+                file=sys.stderr,
+            )
+            return 2
+        resolved.append((rank, pkl, side))
+    if "0" not in {rank for rank, _, _ in resolved}:
+        print(
+            "ERROR: compare-ranks requires rank 0 (deltas are from rank 0); "
+            f"available ranks: {sorted({r for r, _, _ in resolved})}",
+            file=sys.stderr,
+        )
+        return 2
+    base = None
+    if getattr(args, "load_baseline", None):
+        base = _validate_baseline_file(args.load_baseline)
+        if base is None:
+            return 2
+
+    # rank -> {variant_key: row}; also a per-(rank,artifact) summary.
+    by_rank: Dict[str, Dict[Tuple, dict]] = {}
+    artifact_summaries: List[dict] = []
+    for rank, pkl, side in resolved:
         result = _analyze_pickle(pkl, args, sidecar_override=side)
         if result is None:
-            rc = rc or 3
-            continue
-        analyzed += 1
-        rows = _high_water_rows(result)
-        dst = by_rank.setdefault(rank, {})
-        dst.update(rows)
+            print(
+                f"ERROR: failed to analyze {pkl} (compare-ranks aborted)",
+                file=sys.stderr,
+            )
+            return 3
+        by_rank.setdefault(rank, {}).update(_high_water_rows(result))
         artifact_summaries.append(
             {
                 "rank": result.get("rank"),
@@ -1972,13 +2016,10 @@ def _run_compare_ranks(args) -> int:
                 "num_findings": result.get("finding_count"),
             }
         )
-    if analyzed == 0:
-        print("ERROR: compare-ranks analyzed 0 artifacts", file=sys.stderr)
-        return rc or 2
 
     ranks = sorted(by_rank)
-    base_rank = "0" if "0" in ranks else ranks[0]
-    # Union of variant keys across all ranks; per-key per-rank high-water + delta.
+    base_rank = "0"
+    # Union of variant keys across all ranks; per-key per-rank metrics + deltas.
     all_keys = sorted(
         {k for rows in by_rank.values() for k in rows},
         key=lambda k: tuple(str(x) for x in k),
@@ -1986,12 +2027,14 @@ def _run_compare_ranks(args) -> int:
     comparison_rows: List[dict] = []
     for key in all_keys:
         runner, shape, stream, seg, pool = key
-        per_rank = {}
+        hw, reserved, peak = {}, {}, {}
         for rank in ranks:
             row = by_rank[rank].get(key)
             if row is not None:
-                per_rank[rank] = row["high_water_bytes"]
-        base_hw = per_rank.get(base_rank)
+                hw[rank] = row["high_water_bytes"]
+                reserved[rank] = row["reserved_bytes"]
+                peak[rank] = row["window_peak_live_bytes"]
+        base_hw = hw.get(base_rank)
         comparison_rows.append(
             {
                 "runner": runner,
@@ -1999,11 +2042,11 @@ def _run_compare_ranks(args) -> int:
                 "stream_idx": stream,
                 "segment_idx": seg,
                 "pool_id": pool,
-                "high_water_bytes_by_rank": per_rank,
-                "delta_from_rank0_by_rank": (
-                    {r: per_rank[r] - base_hw for r in per_rank}
-                    if base_hw is not None
-                    else {}
+                "high_water_bytes_by_rank": hw,
+                "reserved_bytes_by_rank": reserved,
+                "window_peak_live_bytes_by_rank": peak,
+                "high_water_delta_from_rank0_by_rank": (
+                    {r: hw[r] - base_hw for r in hw} if base_hw is not None else {}
                 ),
             }
         )
@@ -2035,10 +2078,10 @@ def _run_compare_ranks(args) -> int:
             json.dump(baseline, f, indent=2, default=str)
         print(f"saved baseline ({len(baseline['rows'])} rows) to {args.save_baseline}")
 
-    # Baseline load: flag high-water regressions beyond the threshold.
+    # Baseline load: flag high-water regressions beyond the threshold (base was
+    # already validated before analysis, so it is a well-formed baseline here).
     regressions: List[dict] = []
-    if getattr(args, "load_baseline", None):
-        base = _load_json(args.load_baseline) or {}
+    if base is not None:
         base_by_key = {r.get("key"): r for r in base.get("rows") or []}
         thr = float(getattr(args, "baseline_regression_threshold_fraction", 0.0) or 0.0)
         for rank in ranks:
@@ -2076,11 +2119,11 @@ def _run_compare_ranks(args) -> int:
         f"compare-ranks: ranks={ranks} base={base_rank} "
         f"variants={len(comparison_rows)} -> {cmp_path}"
     )
-    if getattr(args, "load_baseline", None):
+    if base is not None:
         print(f"baseline regressions: {len(regressions)} (threshold {thr})")
         if regressions:
             return 4
-    return rc
+    return 0
 
 
 def main() -> int:
@@ -2193,6 +2236,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if (args.save_baseline or args.load_baseline) and not args.compare_ranks:
+        parser.error("--save-baseline/--load-baseline require --compare-ranks")
+    if args.compare_ranks and not args.artifact_dir:
+        parser.error("--compare-ranks requires --artifact-dir")
     if args.artifact_dir and args.compare_ranks:
         return _run_compare_ranks(args)
     if args.artifact_dir:

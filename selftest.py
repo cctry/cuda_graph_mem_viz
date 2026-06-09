@@ -2111,18 +2111,22 @@ def run() -> int:
                 failures.append("task11: comparison must contain per-variant rows")
             else:
                 row = cj["comparison"][0]
-                if (
-                    "high_water_bytes_by_rank" not in row
-                    or "delta_from_rank0_by_rank" not in row
+                for _k in (
+                    "high_water_bytes_by_rank",
+                    "reserved_bytes_by_rank",
+                    "window_peak_live_bytes_by_rank",
+                    "high_water_delta_from_rank0_by_rank",
                 ):
-                    failures.append(
-                        "task11: comparison rows need per-rank high-water + deltas"
-                    )
+                    if _k not in row:
+                        failures.append(f"task11: comparison rows must carry '{_k}'")
+                if set(row.get("high_water_bytes_by_rank", {})) != {"0", "1"}:
+                    failures.append("task11: comparison rows must cover both ranks")
         if _os2.path.exists(_os2.path.join(_tc, "art_rank1.analysis.json")):
             failures.append(
                 "task11: --compare-ranks must not emit ordinary merged analysis"
             )
 
+    # Fail-closed: a missing sidecar for any entry -> nonzero AND no output file.
     with _tf.TemporaryDirectory() as _tc2:
         with open(_os2.path.join(_tc2, "art_rank0.pickle"), "wb") as _f:
             _pk.dump(_pool_raw(8), _f)
@@ -2146,6 +2150,53 @@ def run() -> int:
             failures.append(
                 "task11: --compare-ranks must fail-closed on a missing sidecar"
             )
+        if _os2.path.exists(_os2.path.join(_tc2, "cross_rank_comparison.json")):
+            failures.append(
+                "task11: --compare-ranks must NOT write output when an input is missing"
+            )
+
+    # Fail-closed: partial (rank 0 ok, rank 1 sidecar missing) -> nonzero, no file.
+    with _tf.TemporaryDirectory() as _tcp:
+        _build_cmp_dir(_tcp, {0: 8})
+        with open(_os2.path.join(_tcp, "art_rank1.pickle"), "wb") as _f:
+            _pk.dump(_pool_raw(8), _f)  # rank 1 pickle present, sidecar missing
+        with open(_os2.path.join(_tcp, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 2,
+                            "pickle": "art_rank0.pickle",
+                            "sidecar": "art_rank0.sidecar.json",
+                        },
+                        {
+                            "stem": "art_rank1",
+                            "rank": 1,
+                            "world": 2,
+                            "pickle": "art_rank1.pickle",
+                            "sidecar": "art_rank1.sidecar.json",  # never written
+                        },
+                    ],
+                },
+                _f,
+            )
+        if _run_compare_ranks(_cmp_args(_tcp)) == 0:
+            failures.append(
+                "task11: a partial (missing rank-1 sidecar) must fail closed"
+            )
+        if _os2.path.exists(_os2.path.join(_tcp, "cross_rank_comparison.json")):
+            failures.append("task11: no partial comparison file on a missing input")
+
+    # Fail-closed: rank 0 absent -> nonzero, no file (deltas are from rank 0).
+    with _tf.TemporaryDirectory() as _tcr:
+        _build_cmp_dir(_tcr, {1: 8})  # only rank 1
+        if _run_compare_ranks(_cmp_args(_tcr)) == 0:
+            failures.append("task11: --compare-ranks must fail when rank 0 is absent")
+        if _os2.path.exists(_os2.path.join(_tcr, "cross_rank_comparison.json")):
+            failures.append("task11: no comparison file when rank 0 is absent")
 
     with _tf.TemporaryDirectory() as _tb:
         _build_cmp_dir(_tb, {0: 8})
@@ -2171,6 +2222,22 @@ def run() -> int:
         cj2 = _j.load(open(_os2.path.join(_tb2, "cross_rank_comparison.json")))
         if not cj2.get("baseline_regressions"):
             failures.append("task11: baseline_regressions[] must record the regression")
+
+    # Fail-closed: a missing or malformed --load-baseline -> nonzero, no output.
+    with _tf.TemporaryDirectory() as _tb3:
+        _build_cmp_dir(_tb3, {0: 8})
+        if (
+            _run_compare_ranks(_cmp_args(_tb3, load_baseline="/no/such/baseline.json"))
+            == 0
+        ):
+            failures.append("task11: a missing --load-baseline must fail closed")
+        if _os2.path.exists(_os2.path.join(_tb3, "cross_rank_comparison.json")):
+            failures.append("task11: no output when --load-baseline is missing")
+        _bad = _os2.path.join(_tb3, "bad_baseline.json")
+        with open(_bad, "w") as _f:
+            _f.write('{"rows": [{"no_key": 1}]}')  # missing schema_version + row fields
+        if _run_compare_ranks(_cmp_args(_tb3, load_baseline=_bad)) == 0:
+            failures.append("task11: a malformed --load-baseline must fail closed")
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:
