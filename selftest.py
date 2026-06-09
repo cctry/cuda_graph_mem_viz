@@ -227,22 +227,35 @@ def run() -> int:
     if huge2 is not None and "bridge" not in huge2["label"]:
         failures.append("bridge-backed alloc label should mention bridge")
 
-    # Perfetto export: valid Chrome-trace with a slice per bar + a counter track.
+    # Perfetto memory-map: x = pool offset (ts), slice width = size (dur),
+    # y = capture time as tracks. No sidecar windows here -> uniform time bands.
     trace = to_perfetto(result)
     te = trace.get("traceEvents", [])
-    begins = [e for e in te if e.get("ph") == "b"]
-    counters = [e for e in te if e.get("ph") == "C"]
+    slices = [e for e in te if e.get("ph") == "X"]
     names = [e for e in te if e.get("ph") == "M" and e.get("name") == "process_name"]
-    if len(begins) != result["num_allocations_shown"]:
-        failures.append(
-            f"perfetto: expected {result['num_allocations_shown']} slices, got {len(begins)}"
-        )
-    if not counters:
-        failures.append("perfetto: missing live-bytes counter track")
+    if not slices:
+        failures.append("perfetto: memory-map must emit allocation slices")
     if not names:
         failures.append("perfetto: missing track (process_name) metadata")
-    if not all("ts" in e for e in begins):
-        failures.append("perfetto: slice begin events must carry a ts")
+    if not all("ts" in e and "dur" in e for e in slices):
+        failures.append("perfetto: each slice needs ts (offset) and dur (size)")
+    if any(
+        e["dur"] != e["args"]["size_bytes"]
+        for e in slices
+        if e["args"]["size_bytes"] > 0
+    ):
+        failures.append("perfetto: slice dur must equal allocation size (x = memory)")
+    huge_sl = [e for e in slices if "huge_kv" in e["name"]]
+    if not huge_sl or any(e["ts"] != 0 for e in huge_sl):
+        failures.append("perfetto: huge_kv at the pool base must have ts (offset) = 0")
+    if len({e["pid"] for e in huge_sl}) < 2:
+        failures.append(
+            "perfetto: a long-lived tensor must appear on multiple time tracks (vertical reuse)"
+        )
+    if huge_sl and any(e.get("cname") == "grey" for e in huge_sl):
+        failures.append(
+            "perfetto: an S2 oversized tensor must be color-distinct (not normal)"
+        )
 
     # AC-2: a normal report carries per-block layout for graph-pool segments.
     gp_seg = next((s for s in result["segments"] if s["is_graph_pool"]), None)
@@ -1020,6 +1033,178 @@ def run() -> int:
             "AC-6: a malformed window must appear in omitted_windows with a reason, not be dropped"
         )
 
+    # Round-7 AC-6: report entries carry per-window pool_layout with fragmentation/holes.
+    pl = seg0.get("pool_layout") or []
+    if not pl:
+        failures.append(
+            "AC-6: report entry must carry pool_layout per graph-pool segment"
+        )
+    else:
+        seg_lo = pl[0]
+        for _k in (
+            "segment_address",
+            "total_size",
+            "active_bytes_at_peak",
+            "free_hole_bytes_at_peak",
+            "largest_free_hole_at_peak",
+            "fragmentation_at_peak",
+        ):
+            if _k not in seg_lo:
+                failures.append(f"AC-6: pool_layout missing '{_k}'")
+        if seg_lo.get("allocations") and "offset" not in seg_lo["allocations"][0]:
+            failures.append("AC-6: pool_layout allocations must carry an offset")
+        # holes are consistent: active + free == total.
+        if seg_lo.get("active_bytes_at_peak", 0) + seg_lo.get(
+            "free_hole_bytes_at_peak", 0
+        ) != seg_lo.get("total_size"):
+            failures.append(
+                "AC-6: active + free hole bytes must equal segment total_size"
+            )
+
+    # Round-7 AC-6: explicit semantic group keys (batch_size / num_tokens).
+    std0 = (gr["reports"].get("standard") or [{}])[0]
+    pw0 = (gr["reports"].get("piecewise") or [{}])[0]
+    if "batch_size" not in std0:
+        failures.append("AC-6: standard report entry must expose explicit batch_size")
+    if "num_tokens" not in pw0:
+        failures.append("AC-6: piecewise report entry must expose explicit num_tokens")
+
+    # Round-7 AC-6: a malformed BREAKABLE capture window must be recorded in
+    # omitted_windows (validated, not skipped before validation).
+    bbad = analyze(
+        normalize(_build_raw()),
+        sidecar={
+            "schema_version": 1,
+            "runner": "breakable",
+            "rank": 0,
+            "world": 1,
+            "capture_windows": [
+                {
+                    "runner": "breakable",
+                    "axis": "num_tokens",
+                    "value": 8,
+                    "stream_idx": None,
+                    "begin_ord": 7,
+                    "end_ord": 3,  # begin > end
+                    "window_key": "brk_bad",
+                }
+            ],
+            "segment_windows": [],
+            "graph_slots": [],
+            "bridges": [],
+        },
+    )
+    if not any(
+        o.get("window_key") == "brk_bad"
+        for o in ((bbad.get("reports") or {}).get("omitted_windows") or [])
+    ):
+        failures.append(
+            "AC-6: a malformed breakable capture window must appear in omitted_windows"
+        )
+
+    # Round-7 AC-9: windowed Perfetto memory-map -> a tensor live across 2 windows
+    # appears on both window tracks at the same offset (vertical reuse column).
+    mm = []
+
+    def _mma(addr, size, name):
+        mm.append(
+            {
+                "action": "alloc",
+                "addr": addr,
+                "size": size,
+                "time_us": len(mm) * 10,
+                "frames": _frame(name),
+            }
+        )
+
+    def _mmf(addr):
+        mm.append(
+            {
+                "action": "free_requested",
+                "addr": addr,
+                "size": 0,
+                "time_us": len(mm) * 10,
+                "frames": [],
+            }
+        )
+
+    _mma(GP, 4 * MiB, "persist")  # ord0 never freed -> spans both windows
+    _mma(GP + 8 * MiB, 1 * MiB, "t0")  # ord1
+    _mmf(GP + 8 * MiB)  # ord2
+    _mma(GP + 8 * MiB, 1 * MiB, "t1")  # ord3 reuse
+    mm_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 4 * MiB,
+                        "requested_size": 4 * MiB,
+                        "state": "active_allocated",
+                        "frames": _frame("persist"),
+                    }
+                ],
+            }
+        ],
+        "device_traces": [mm],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    mmres = analyze(
+        normalize(mm_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "rank": 0,
+            "world": 1,
+            "bridges": [],
+            "segment_windows": [],
+            "capture_windows": [
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 1,
+                    "stream_idx": 0,
+                    "begin_ord": 0,
+                    "end_ord": 2,
+                    "window_key": "w0",
+                },
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 2,
+                    "stream_idx": 0,
+                    "begin_ord": 2,
+                    "end_ord": 4,
+                    "window_key": "w1",
+                },
+            ],
+            "graph_slots": [],
+        },
+    )
+    mmte = to_perfetto(mmres)["traceEvents"]
+    track_names = [
+        e for e in mmte if e.get("ph") == "M" and e.get("name") == "process_name"
+    ]
+    if len(track_names) != 2:
+        failures.append(
+            "AC-9: windowed memory-map must have one track per capture window"
+        )
+    persist_sl = [e for e in mmte if e.get("ph") == "X" and "persist" in e["name"]]
+    if len({e["pid"] for e in persist_sl}) < 2:
+        failures.append(
+            "AC-9: a tensor live across 2 windows must appear on both window tracks"
+        )
+    if persist_sl and len({e["ts"] for e in persist_sl}) != 1:
+        failures.append(
+            "AC-9: the same tensor must sit at the same offset across tracks (vertical column)"
+        )
+
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
     try:
@@ -1162,6 +1347,8 @@ def run() -> int:
     with _tf.TemporaryDirectory() as _td3:
         with open(_os2.path.join(_td3, "art_rank1.pickle"), "wb") as _f:
             _pk.dump(_build_raw(), _f)
+        with open(_os2.path.join(_td3, "art_rank1.sidecar.json"), "w") as _f:
+            _j.dump(_side(1), _f)
         with open(_os2.path.join(_td3, "artifact_manifest.json"), "w") as _f:
             _j.dump(
                 {
@@ -1172,6 +1359,7 @@ def run() -> int:
                             "rank": 1,
                             "world": 2,
                             "pickle": "art_rank1.pickle",
+                            "sidecar": "art_rank1.sidecar.json",
                         }
                     ],
                 },
@@ -1183,6 +1371,90 @@ def run() -> int:
             )
         if _run_artifact_dir(_mk_args(_td3, rank=1)) != 0:
             failures.append("AC-7: explicit --rank 1 should analyze rank 1")
+
+    # Round-7 AC-7: a manifest-named sidecar that is MISSING must fail closed.
+    with _tf.TemporaryDirectory() as _td4:
+        with open(_os2.path.join(_td4, "art_rank0.pickle"), "wb") as _f:
+            _pk.dump(_build_raw(), _f)
+        # No sidecar file written, but the manifest names one.
+        with open(_os2.path.join(_td4, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 2,
+                            "pickle": "art_rank0.pickle",
+                            "sidecar": "art_rank0.sidecar.json",
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td4)) == 0:
+            failures.append(
+                "AC-7: a missing selected sidecar must fail closed (nonzero), not analyze without provenance"
+            )
+        if _os2.path.exists(_os2.path.join(_td4, "art_rank0.analysis.json")):
+            failures.append(
+                "AC-7: no analysis JSON should be written when the selected sidecar is missing"
+            )
+
+    # Round-7 AC-7: an UNREADABLE selected sidecar must fail closed.
+    with _tf.TemporaryDirectory() as _td5:
+        with open(_os2.path.join(_td5, "art_rank0.pickle"), "wb") as _f:
+            _pk.dump(_build_raw(), _f)
+        with open(_os2.path.join(_td5, "art_rank0.sidecar.json"), "w") as _f:
+            _f.write("{ this is not valid json")
+        with open(_os2.path.join(_td5, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 2,
+                            "pickle": "art_rank0.pickle",
+                            "sidecar": "art_rank0.sidecar.json",
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td5)) == 0:
+            failures.append(
+                "AC-7: an unreadable selected sidecar must fail closed (nonzero)"
+            )
+
+    # Round-7 AC-7: manifest sidecar path may differ from the sibling stem and is honored.
+    with _tf.TemporaryDirectory() as _td6:
+        with open(_os2.path.join(_td6, "art_rank0.pickle"), "wb") as _f:
+            _pk.dump(_build_raw(), _f)
+        with open(_os2.path.join(_td6, "custom_name.sidecar.json"), "w") as _f:
+            _j.dump(_side(0), _f)
+        with open(_os2.path.join(_td6, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 2,
+                            "pickle": "art_rank0.pickle",
+                            "sidecar": "custom_name.sidecar.json",
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td6)) != 0:
+            failures.append(
+                "AC-7: a manifest sidecar path differing from the sibling stem must be honored"
+            )
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

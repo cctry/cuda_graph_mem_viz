@@ -436,8 +436,45 @@ def _apply_graph_slots(
 _REPORT_ALLOC_CAP = 25  # per-window allocation records kept (largest first)
 
 
-def _window_metrics(graph: List[Allocation], begin: int, end: int) -> dict:
-    """Per-window stats: counts, bytes, in-window peak, capped allocation records.
+def _segment_fill_at_peak(
+    live_in_seg: List[Allocation], seg_base: int, seg_size: int
+) -> Tuple[int, int, int]:
+    """Within one segment at the window's peak ordinal, return (active_bytes,
+    free_hole_bytes, largest_free_hole) from the union of live address ranges.
+
+    Holes are the gaps the allocator could not reuse at peak; computed from the
+    live allocation addresses + segment base/size, independent of block layout."""
+    ivals = sorted(
+        (max(a.addr, seg_base), min(a.addr + a.size, seg_base + seg_size))
+        for a in live_in_seg
+    )
+    seg_end = seg_base + seg_size
+    cursor = seg_base
+    covered = 0
+    largest = 0
+    for lo, hi in ivals:
+        if hi <= lo:
+            continue
+        if lo > cursor:
+            largest = max(largest, lo - cursor)
+            cursor = lo
+        if hi > cursor:
+            covered += hi - cursor
+            cursor = hi
+    if seg_end > cursor:
+        largest = max(largest, seg_end - cursor)
+    return covered, seg_size - covered, largest
+
+
+def _window_metrics(
+    graph: List[Allocation],
+    begin: int,
+    end: int,
+    graph_segs: Optional[List[dict]] = None,
+) -> dict:
+    """Per-window stats: counts, bytes, in-window peak, capped allocation records,
+    and per-graph-pool-segment ``pool_layout`` (offsets + fragmentation/holes at the
+    window peak).
 
     ``peak_live_bytes`` clips each allocation's lifetime to ``[begin, end)`` so it
     reflects bytes simultaneously live *during this window*, the quantity that
@@ -471,6 +508,45 @@ def _window_metrics(graph: List[Allocation], begin: int, end: int) -> dict:
         }
         for a in top[:_REPORT_ALLOC_CAP]
     ]
+
+    # Per-segment pool layout at the peak ordinal: which tensor owns which offset
+    # range, plus the holes that could not be reused at that moment.
+    live_at_peak = [
+        a for a in inwin if max(a.alloc_ord, begin) <= peak_at < min(a.free_ord, end)
+    ]
+    pool_layout: List[dict] = []
+    for seg in graph_segs or []:
+        sb, ss = seg["address"], seg["total_size"]
+        in_seg = [a for a in inwin if sb <= a.addr < sb + ss]
+        live_seg = [a for a in live_at_peak if sb <= a.addr < sb + ss]
+        active, free, largest = _segment_fill_at_peak(live_seg, sb, ss)
+        in_seg.sort(key=lambda a: a.size, reverse=True)
+        pool_layout.append(
+            {
+                "segment_address": sb,
+                "pool_id": seg["pool_id"],
+                "total_size": ss,
+                "peak_ordinal": peak_at,
+                "active_bytes_at_peak": active,
+                "free_hole_bytes_at_peak": free,
+                "largest_free_hole_at_peak": largest,
+                "fragmentation_at_peak": (free / ss) if ss else 0.0,
+                "allocations": [
+                    {
+                        "addr": a.addr,
+                        "offset": a.addr - sb,
+                        "size": a.size,
+                        "label": a.label,
+                        "slot_name": a.slot_name,
+                        "flags": list(a.flags),
+                        "begin_ord": max(a.alloc_ord, begin),
+                        "end_ord": min(a.free_ord, end),
+                    }
+                    for a in in_seg[:_REPORT_ALLOC_CAP]
+                ],
+                "allocations_omitted": max(0, len(in_seg) - _REPORT_ALLOC_CAP),
+            }
+        )
     return {
         "num_allocations": len(inwin),
         "total_bytes": sum(a.size for a in inwin),
@@ -479,6 +555,7 @@ def _window_metrics(graph: List[Allocation], begin: int, end: int) -> dict:
         "signature_counts": sigc,
         "allocations": records,
         "allocations_omitted": max(0, len(inwin) - len(records)),
+        "pool_layout": pool_layout,
     }
 
 
@@ -529,6 +606,7 @@ def _build_reports(
     capture_windows_raw: List[dict],
     segment_windows_raw: List[dict],
     bridges: Optional[List[dict]] = None,
+    seg_summaries: Optional[List[dict]] = None,
 ) -> dict:
     """Group graph-pool allocations into per-window reports.
 
@@ -536,10 +614,13 @@ def _build_reports(
     breakable -> keyed by (num_tokens, segment_idx) from segment windows;
     piecewise -> keyed by num_tokens from capture windows.
 
-    Malformed windows (missing/negative/inverted ordinals) are never silently
-    dropped — they are recorded in ``omitted_windows`` with a reason.
+    Each entry carries explicit group keys plus per-window metrics and per-segment
+    ``pool_layout`` (offsets + fragmentation/holes at peak). Malformed windows
+    (missing/negative/inverted ordinals) — including breakable capture windows —
+    are never silently dropped; they are recorded in ``omitted_windows``.
     """
     graph = [a for a in allocs if _is_graph_pool(a.pool_id)]
+    graph_segs = [s for s in (seg_summaries or []) if s.get("is_graph_pool")]
     omitted: List[dict] = []
 
     def _range(w: dict, kind: str):
@@ -577,8 +658,13 @@ def _build_reports(
     reports: Dict[str, object] = {"standard": [], "breakable": [], "piecewise": []}
     for w in capture_windows_raw:
         runner = w.get("runner")
+        # Validate ordinals first so malformed metadata is recorded even for
+        # breakable capture windows (which are otherwise superseded by segments).
+        rng = _range(w, "capture")
+        if rng is None:
+            continue
         if runner == "breakable":
-            continue  # breakable is grouped by segment_windows below, not omitted
+            continue  # valid breakable capture windows are grouped via segment_windows
         if runner not in reports:
             omitted.append(
                 {
@@ -588,23 +674,22 @@ def _build_reports(
                 }
             )
             continue
-        rng = _range(w, "capture")
-        if rng is None:
-            continue
         b, e = rng
+        key_name = "num_tokens" if runner == "piecewise" else "batch_size"
         reports[runner].append(  # type: ignore[union-attr]
             {
                 "group": {
                     "runner": runner,
-                    "value": w.get("value"),
+                    key_name: w.get("value"),
                     "stream_idx": w.get("stream_idx"),
                 },
                 "window_key": w.get("window_key"),
+                key_name: w.get("value"),
                 "value": w.get("value"),
                 "stream_idx": w.get("stream_idx"),
                 "begin_ord": b,
                 "end_ord": e,
-                **_window_metrics(graph, b, e),
+                **_window_metrics(graph, b, e, graph_segs),
             }
         )
     for w in segment_windows_raw:
@@ -624,7 +709,7 @@ def _build_reports(
                 "segment_idx": w.get("segment_idx"),
                 "begin_ord": b,
                 "end_ord": e,
-                **_window_metrics(graph, b, e),
+                **_window_metrics(graph, b, e, graph_segs),
             }
         )
     breakable_caps = [w for w in capture_windows_raw if w.get("runner") == "breakable"]
@@ -841,7 +926,7 @@ def analyze(
             snap, allocs, graph_slots, windows_by_key
         )
         reports = _build_reports(
-            allocs, capture_windows_raw, segment_windows_raw, eff_bridges
+            allocs, capture_windows_raw, segment_windows_raw, eff_bridges, seg_summaries
         )
 
         shown = (
@@ -1140,119 +1225,140 @@ non-reusable (approx): <b>{sc.get('S3_non_reusable_approx', 0)}</b>
 # Perfetto / Chrome trace export (load at ui.perfetto.dev or any Perfetto).
 # --------------------------------------------------------------------------- #
 
-# (flag key, track label, Perfetto reserved color name, pid lane).
-_PERFETTO_TRACKS = [
-    ("S2_pool_bloating", "pool-bloating (huge)", "terrible", 1),
-    ("S3_non_reusable", "non-reusable bridge", "olive", 2),
-    ("S1_lingering", "lingering (long-lived)", "bad", 3),
-    (None, "normal", "grey", 4),
+# (signature flag key, Perfetto reserved color name). First match wins; the bar
+# colour makes the three inefficiency signatures visually distinct in the map.
+_PERFETTO_SIG_COLORS = [
+    ("S2_pool_bloating", "terrible"),  # oversized (red)
+    ("S3_non_reusable", "olive"),  # non-reusable across graphs
+    ("S3_non_reusable_approx", "olive"),
+    ("S1_lingering", "bad"),  # lingering (orange)
 ]
-_PERFETTO_COUNTER_PID = 9
+_PERFETTO_NORMAL_COLOR = "grey"
+_PERFETTO_MAX_BANDS = 12  # fallback time bands when no capture windows exist
+
+
+def _perfetto_cname(flags: List[str]) -> str:
+    for key, cname in _PERFETTO_SIG_COLORS:
+        if key in flags:
+            return cname
+    return _PERFETTO_NORMAL_COLOR
+
+
+def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
+    """Ordered (label, begin_ord, end_ord) time tracks for the memory map.
+
+    Prefer real capture/segment windows from the report (semantic time axis);
+    otherwise fall back to uniform capture-order bands so the y-axis still reads."""
+    tracks: List[Tuple[str, int, int]] = []
+    reps = result.get("reports") or {}
+    for runner in ("standard", "piecewise", "breakable"):
+        for w in reps.get(runner) or []:
+            b, e = w.get("begin_ord"), w.get("end_ord")
+            if b is None or e is None:
+                continue
+            if runner == "standard":
+                lbl = f"standard bs={w.get('batch_size')} stream={w.get('stream_idx')}"
+            elif runner == "piecewise":
+                lbl = f"piecewise num_tokens={w.get('num_tokens')}"
+            else:
+                lbl = f"breakable nt={w.get('num_tokens')} seg={w.get('segment_idx')}"
+            tracks.append((lbl, int(b), int(e)))
+    if not tracks:
+        end = max(int(result.get("event_count", 0)), 1)
+        nb = max(1, min(_PERFETTO_MAX_BANDS, end))
+        step = max(1, -(-end // nb))  # ceil division
+        lo = 0
+        while lo < end:
+            hi = min(lo + step, end)
+            tracks.append((f"capture-order [{lo},{hi})", lo, hi))
+            lo = hi
+    tracks.sort(key=lambda t: (t[1], t[2]))
+    return tracks
 
 
 def to_perfetto(result: dict) -> dict:
-    """Chrome Trace Event JSON for Perfetto (https://ui.perfetto.dev).
+    """Chrome Trace Event JSON for Perfetto (https://ui.perfetto.dev) rendered as a
+    **memory map over capture time**.
 
-    Each allocation is a nestable-async slice (ph b/e) on a per-signature track,
-    coloured by signature; the x-axis is the capture-order event ordinal (NOT
-    wall-clock, consistent with AC-8). A counter track plots graph-pool live
-    bytes over capture order. This is a standard Chrome trace, so it loads in any
-    Perfetto instance and supports zoom / search / filter over all allocations.
+    Axis convention (per the user's mental model):
+      * x-axis (Perfetto "time") = memory OFFSET within the graph pool
+        (``addr - pool_base``); a slice's width = the allocation's size, so reading
+        horizontally shows how large a tensor is.
+      * y-axis = capture-order TIME, realized as one track per capture/segment
+        window ordered top→bottom (uniform capture-order bands when no sidecar
+        windows exist); reading vertically down a memory column shows how that
+        region is reused by different tensors across time.
+
+    A tensor live across N windows appears on N consecutive tracks at the same
+    x-offset. Slices are coloured by inefficiency signature. Lifetime stays
+    capture-order (AC-8), never wall-clock. Loads in any Perfetto instance.
     """
-    cname_by_pid = {pid: cname for _, _, cname, pid in _PERFETTO_TRACKS}
-    normal_pid = _PERFETTO_TRACKS[-1][3]
+    bars = result.get("bars") or []
+    # Pool base = smallest graph-pool segment address (fallback: smallest bar addr).
+    seg_bases = [
+        s["address"]
+        for s in result.get("segments", [])
+        if s.get("is_graph_pool") and s.get("address") is not None
+    ]
+    if not seg_bases and bars:
+        seg_bases = [min(b["addr"] for b in bars)]
+    pool_base = min(seg_bases) if seg_bases else 0
 
-    def categorize(flags: List[str]) -> int:
-        for key, _lbl, _c, pid in _PERFETTO_TRACKS[:-1]:
-            if key in flags:
-                return pid
-        return normal_pid
-
+    tracks = _memory_map_tracks(result)
     events: List[dict] = []
-    for _key, label, _cname, pid in _PERFETTO_TRACKS:
+    for i, (label, b0, e0) in enumerate(tracks):
+        pid = i + 1
+        events.append(
+            {"ph": "M", "pid": pid, "name": "process_name", "args": {"name": label}}
+        )
+        # Keep tracks in capture-time order (earliest window at the top).
         events.append(
             {
                 "ph": "M",
                 "pid": pid,
-                "name": "process_name",
-                "args": {"name": f"graph pool — {label}"},
+                "name": "process_sort_index",
+                "args": {"sort_index": i},
             }
         )
-    events.append(
-        {
-            "ph": "M",
-            "pid": _PERFETTO_COUNTER_PID,
-            "name": "process_name",
-            "args": {"name": "graph pool — live bytes (MiB)"},
-        }
-    )
-
-    uid = 0
-    for b in result["bars"]:
-        pid = categorize(b["flags"])
-        uid += 1
-        ts = b["alloc_ord"]
-        dur = max(b["free_ord"] - b["alloc_ord"], 1)
-        args = {
-            "size_MiB": round(b["size"] / (1024 * 1024), 3),
-            "size_bytes": b["size"],
-            "addr": hex(b["addr"]),
-            "pool_id": str(b["pool_id"]),
-            "flags": ",".join(b["flags"]) or "none",
-            "never_freed": b["never_freed"],
-            "alloc_ord": b["alloc_ord"],
-            "free_ord": b["free_ord"],
-        }
-        events.append(
-            {
-                "ph": "b",
-                "pid": pid,
-                "tid": 0,
-                "id": uid,
-                "cat": "alloc",
-                "name": b["label"],
-                "ts": ts,
-                "cname": cname_by_pid[pid],
-                "args": args,
-            }
-        )
-        events.append(
-            {
-                "ph": "e",
-                "pid": pid,
-                "tid": 0,
-                "id": uid,
-                "cat": "alloc",
-                "name": b["label"],
-                "ts": ts + dur,
-            }
-        )
-
-    # Counter track: graph-pool live bytes over capture order.
-    deltas: List[Tuple[int, int]] = []
-    for b in result["bars"]:
-        deltas.append((b["alloc_ord"], b["size"]))
-        deltas.append((b["free_ord"], -b["size"]))
-    deltas.sort()
-    live = 0
-    for ts, d in deltas:
-        live += d
-        events.append(
-            {
-                "ph": "C",
-                "pid": _PERFETTO_COUNTER_PID,
-                "ts": ts,
-                "name": "live",
-                "args": {"MiB": round(live / (1024 * 1024), 2)},
-            }
-        )
+        for b in bars:
+            if not (b["alloc_ord"] < e0 and b0 < b["free_ord"]):
+                continue
+            offset = b["addr"] - pool_base
+            events.append(
+                {
+                    "ph": "X",  # complete slice: ts=offset, dur=size (x = memory)
+                    "pid": pid,
+                    "tid": 0,
+                    "cat": "alloc",
+                    "name": b["label"],
+                    "ts": offset,
+                    "dur": max(b["size"], 1),
+                    "cname": _perfetto_cname(b["flags"]),
+                    "args": {
+                        "size_MiB": round(b["size"] / (1024 * 1024), 3),
+                        "size_bytes": b["size"],
+                        "offset_bytes": offset,
+                        "addr": hex(b["addr"]),
+                        "pool_id": str(b["pool_id"]),
+                        "slot_name": b.get("slot_name"),
+                        "flags": ",".join(b["flags"]) or "none",
+                        "window": label,
+                        "alloc_ord": b["alloc_ord"],
+                        "free_ord": b["free_ord"],
+                    },
+                }
+            )
 
     return {
         "displayTimeUnit": "ns",
         "traceEvents": events,
         "metadata": {
             "tool": "cg_mem_inspect",
-            "x_axis": "capture-order allocator event ordinal (not wall-clock)",
+            "view": "memory map: x=pool offset (bytes), y=capture time (tracks top->bottom)",
+            "x_axis": "memory offset within graph pool (bytes); slice width = allocation size",
+            "y_axis": "capture-order time as per-window tracks (earliest at top); not wall-clock",
+            "pool_base": hex(pool_base),
+            "num_tracks": len(tracks),
             "peak_live_MiB": round(result["peak_live_bytes"] / (1024 * 1024), 2),
             "cross_graph_signature": result["cross_graph_signature"],
         },
@@ -1290,10 +1396,24 @@ def _run_one(
         d = _load_json(bpath)
         bridges = (d or {}).get("bridges")
 
+    # An explicit sidecar (from --sidecar or the artifact manifest) is fail-closed:
+    # if it is named but missing/unreadable we refuse to analyze, because dropping it
+    # would silently lose the rank/world provenance and capture windows. A sibling
+    # sidecar auto-discovered for a bare pickle stays optional.
     sidecar = None
+    explicit_sidecar = sidecar_override is not None
     spath = sidecar_override or (stem + ".sidecar.json")
+    if explicit_sidecar and not os.path.exists(spath):
+        print(f"SIDECAR ERROR (failing closed): {spath} not found", file=sys.stderr)
+        return 3
     if os.path.exists(spath):
         sidecar = _load_json(spath)
+        if sidecar is None and explicit_sidecar:
+            print(
+                f"SIDECAR ERROR (failing closed): could not load {spath}",
+                file=sys.stderr,
+            )
+            return 3
         if sidecar:
             print(
                 f"loaded sidecar (windows={len(sidecar.get('capture_windows') or [])}, "
@@ -1411,9 +1531,13 @@ def _run_artifact_dir(args) -> int:
         side = os.path.join(
             args.artifact_dir, a.get("sidecar") or (stem + ".sidecar.json")
         )
-        one_rc = _run_one(
-            pkl, args, sidecar_override=side if os.path.exists(side) else None
-        )
+        if not os.path.exists(side):
+            # Manifest-named sidecar is mandatory: without it the rank/world header
+            # and capture windows are lost. Fail rather than silently analyze.
+            print(f"ERROR: missing sidecar {side}", file=sys.stderr)
+            rc = rc or 2
+            continue
+        one_rc = _run_one(pkl, args, sidecar_override=side)
         if one_rc == 0:
             analyzed += 1
         else:
