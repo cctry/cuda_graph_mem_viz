@@ -1,8 +1,12 @@
 # cg_mem_inspect — CUDA-graph pool memory inspector
 
 Records, analyzes, and visualizes SGLang's shared CUDA-graph memory pool as a
-**Gantt of per-tensor capture-order lifetimes**, auto-flagging three inefficiency
-signatures. No edits to `sglang/` or `sglang_meta/` — capture is a runtime shim.
+**Perfetto memory map over capture time** — y-axis = capture time (one track per
+capture/segment window, earliest at top), x-axis = pool memory offset (a tensor's
+slice width = its size). Reading down a memory column shows how a region is reused
+by different tensors across time; reading across shows how large a tensor is. The
+three inefficiency signatures are colored. No edits to `sglang/` or `sglang_meta/`
+— capture is a runtime shim.
 
 ## Prereqs
 - A GPU + the project uv env (`torch 2.11`). Prefix commands with
@@ -48,9 +52,10 @@ uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
 Auto-loads the sibling `.sidecar.json` (and `capability_manifest.json`) and emits
 three outputs next to the pickle:
 - `*.analysis.json` — per-allocation + per-segment data (layout, fragmentation,
-  lifetimes, signatures, `graph_slot_labels` with provenance, `sidecar_meta`)
-- `*.gantt.html` — self-contained HTML Gantt (capped to flagged + largest bars)
-- `*.perfetto.json` — Chrome trace for the Perfetto web UI
+  lifetimes, signatures, `graph_slot_labels` with provenance, `sidecar_meta`, and
+  per-window `reports` with `pool_layout` holes/fragmentation at peak)
+- `*.perfetto.json` — Chrome trace for the Perfetto web UI (the memory map)
+- `*.gantt.html` — self-contained offline fallback (capped to flagged + largest bars)
 
 Cross-graph (non-reusable) S3 is reported **precise** only with real evidence
 (an event-windowed bridge match, or an allocation spanning >1 capture window);
@@ -59,30 +64,35 @@ otherwise it is `approximate`/`mixed`, and `none` when nothing qualifies.
 Useful flags: `--include-default-pool`, `--max-rows N` (HTML), `--sidecar <path>`,
 `--manifest <path>`, `--out-dir <dir>`.
 
-## 3. View the Gantt
+## 3. View the memory map (Perfetto)
 
 **Perfetto web (interactive — recommended):**
 ```bash
 uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py --host <host-reachable-from-your-browser>
 ```
 Click the printed `https://ui.perfetto.dev/#!/?url=...` link. (Or drag the
-`*.perfetto.json` onto https://ui.perfetto.dev directly.) You get tracks per
-signature + a "live bytes (MiB)" counter, with zoom/search/filter over all
-allocations (e.g. search `fused_norm_residual` for persistent bridges).
+`*.perfetto.json` onto https://ui.perfetto.dev directly.) Each row (track) is a
+capture/segment window in time order; each slice is a tensor placed at its pool
+offset with width = its size. Zoom/search/filter over all allocations (e.g. search
+`fused_norm_residual` for persistent bridges). Reading conventions:
+- **down a memory column** (same x across stacked tracks) → how that region is
+  reused by different tensors over capture time;
+- **across a slice** → the tensor's size.
 
-**Static HTML:** open `*.gantt.html` in a browser / IDE.
+**Static HTML fallback:** open `*.gantt.html` (an offline per-tensor lifetime view).
 
-## Reading it — the three signatures
-- 🔴 **pool-bloating** — abnormally large allocation inflating the pool.
-- 🫒 **non-reusable bridge** — weak-ref tensor whose region spans graph/segment
-  boundaries (can't be reused); a full-width bar = lives the entire capture.
-- 🟧 **lingering** — a should-be-short-lived tensor with an unusually long lifetime.
+## Reading it — the three signatures (slice color)
+- 🔴 **pool-bloating** — abnormally large allocation (very wide slice) inflating the pool.
+- 🫒 **non-reusable** — a region that persists across windows (the same column stays
+  occupied down many tracks); weak-ref bridges across breakable segments show here.
+- 🟧 **lingering** — a should-be-short-lived tensor that stays occupied across windows.
 
 Labels come from the allocating call-site frame (e.g. `forward_cuda_c (fused_norm_residual.py:371)`).
 
 ## Notes
 - **Lifetime = capture/segment order**, not replay wall-clock (CUDA graph replay
-  does no allocations). The Perfetto x-axis is the capture-order event ordinal.
+  does no allocations). The Perfetto y-axis (tracks) is capture-order time; the
+  x-axis is pool memory offset (not wall-clock).
 - Pool attribution uses the allocator's `segment_pool_id` (graph pool vs default).
 - `artifacts/` is git-ignored (snapshots are large).
 - Run the self-test: `uv run --no-sync python -m personal.shiyang.cg_mem_inspect.selftest`.
