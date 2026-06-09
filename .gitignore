@@ -1,0 +1,3 @@
+# Runtime-generated capture artifacts (snapshots, bridge sidecars, reports).
+artifacts/
+__pycache__/
