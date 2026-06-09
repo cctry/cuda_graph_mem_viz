@@ -14,10 +14,12 @@ from __future__ import annotations
 import sys
 
 try:
+    from . import shim as shim_mod
     from .analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
     from .schema import SchemaError, normalize
     from .shim import _window_key
 except ImportError:  # run directly by path
+    import shim as shim_mod
     from analyzer import _run_artifact_dir, analyze, to_html, to_perfetto
     from schema import SchemaError, normalize
     from shim import _window_key
@@ -851,6 +853,214 @@ def run() -> int:
             "AC-5: window-keyed GraphSlot must NOT label a reused address in another window"
         )
 
+    # Round-6 AC-5: a GraphSlot allocated BEFORE its window but live THROUGH it
+    # must be labeled (lifetime/window OVERLAP, not alloc-start containment).
+    ov = []
+
+    def _oa(addr, size, name):
+        ov.append(
+            {
+                "action": "alloc",
+                "addr": addr,
+                "size": size,
+                "time_us": len(ov) * 10,
+                "frames": _frame(name),
+            }
+        )
+
+    def _of(addr):
+        ov.append(
+            {
+                "action": "free_requested",
+                "addr": addr,
+                "size": 0,
+                "time_us": len(ov) * 10,
+                "frames": [],
+            }
+        )
+
+    _oa(GP, 8 * MiB, "persistent")  # ord0, never freed -> live [0, END)
+    _oa(GP + 16 * MiB, 1 * MiB, "f0")  # ord1
+    _of(GP + 16 * MiB)  # ord2
+    _oa(GP + 16 * MiB, 1 * MiB, "f1")  # ord3
+    ov_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "active_allocated",
+                        "frames": _frame("persistent"),
+                    }
+                ],
+            }
+        ],
+        "device_traces": [ov],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    ovr = analyze(
+        normalize(ov_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "rank": 0,
+            "world": 1,
+            "bridges": [],
+            "segment_windows": [],
+            "capture_windows": [
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 2,
+                    "stream_idx": 0,
+                    "begin_ord": 2,
+                    "end_ord": 4,
+                    "window_key": "wC",
+                }
+            ],
+            "graph_slots": [
+                {
+                    "name": "slotC",
+                    "storage_data_ptr": GP,
+                    "nbytes": 8 * MiB,
+                    "shape": [1],
+                    "dtype": "torch.int8",
+                    "window_key": "wC",
+                }
+            ],
+        },
+    )
+    persist_bar = next((b for b in ovr["bars"] if b["alloc_ord"] == 0), None)
+    if persist_bar is None or persist_bar.get("slot_name") != "slotC":
+        failures.append(
+            "AC-5: a GraphSlot live through its window (allocated before it) must "
+            "be labeled via lifetime/window overlap"
+        )
+
+    # Round-6 AC-6: enriched reports — per-window peak + capped allocation records,
+    # breakable bridge persistence, and omitted-window accounting (no silent drop).
+    enr = analyze(
+        normalize(_build_raw()),
+        sidecar={
+            "schema_version": 1,
+            "runner": "breakable",
+            "rank": 3,
+            "world": 8,
+            "capture_windows": [
+                {
+                    "runner": "standard",
+                    "axis": "bs",
+                    "value": 1,
+                    "stream_idx": 0,
+                    "begin_ord": 5,
+                    "end_ord": 2,  # begin > end -> must be omitted with a reason
+                    "window_key": "bad",
+                }
+            ],
+            "segment_windows": [
+                {
+                    "num_tokens": 8,
+                    "segment_idx": 0,
+                    "begin_ord": 0,
+                    "end_ord": 4,
+                    "window_key": "brk/seg0",
+                }
+            ],
+            "graph_slots": [],
+            "bridges": [
+                {
+                    "storage_data_ptr": GP,
+                    "storage_nbytes": 150 * MiB,
+                    "from_segment": 0,
+                    "to_segment": 1,
+                    "num_tokens": 8,
+                    "event_ord": 0,
+                    "name": "kv.bridge",
+                },
+                {
+                    "storage_data_ptr": GP,
+                    "storage_nbytes": 150 * MiB,
+                    "from_segment": 0,
+                    "to_segment": 1,
+                    "num_tokens": 8,
+                    "event_ord": 0,
+                    "name": "kv.bridge2",
+                },
+            ],
+        },
+    )
+    ereps = enr.get("reports") or {}
+    seg0 = (ereps.get("breakable") or [{}])[0]
+    for _k in ("peak_live_bytes", "peak_live_at_ordinal", "allocations", "group"):
+        if _k not in seg0:
+            failures.append(f"AC-6: breakable report entry missing '{_k}'")
+    if seg0.get("allocations") and not all(
+        "alloc_ord" in r and "size" in r for r in seg0["allocations"]
+    ):
+        failures.append("AC-6: allocation records must carry size + alloc_ord")
+    bp = ereps.get("breakable_bridges") or []
+    if not bp or bp[0].get("count") != 2:
+        failures.append(
+            "AC-6: breakable bridge persistence must group bridges by num_tokens/segment (count=2)"
+        )
+    ow_list = ereps.get("omitted_windows") or []
+    if not any(
+        o.get("window_key") == "bad" and "begin_ord" in (o.get("reason") or "")
+        for o in ow_list
+    ):
+        failures.append(
+            "AC-6: a malformed window must appear in omitted_windows with a reason, not be dropped"
+        )
+
+    # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
+    # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
+    try:
+        import torch as _torch
+    except Exception:
+        _torch = None
+    if _torch is not None:
+
+        class _FakeSlot:
+            def __init__(self, buf):
+                self.buffer = buf
+
+        class _FakeReg:
+            def __init__(self, slots):
+                self._slots = slots
+
+            def slot_names(self):
+                return list(self._slots)
+
+            def get_slot(self, n):
+                return _FakeSlot(self._slots[n])
+
+        class _FakeRunner:
+            def __init__(self, reg):
+                self.buffer_registry = reg
+
+        shim_mod._reset_accumulators()
+        _runner = _FakeRunner(_FakeReg({"sb": _torch.zeros(16, dtype=_torch.int8)}))
+        for _wk in ("W1", "W2", "W2"):  # W2 twice -> deduped to a single record
+            _tk = shim_mod._cur_window_key.set(_wk)
+            try:
+                shim_mod._extract_graph_slots(_runner)
+            finally:
+                shim_mod._cur_window_key.reset(_tk)
+        _wkeys = sorted(s["window_key"] for s in shim_mod._graph_slots)
+        if _wkeys != ["W1", "W2"]:
+            failures.append(
+                f"AC-5 (shim): static buffer must be recorded once per window, got {_wkeys}"
+            )
+        shim_mod._reset_accumulators()
+
     # Round-5 AC-7: --artifact-dir picks rank 0 and never merges ranks.
     import json as _j
     import os as _os2
@@ -858,35 +1068,11 @@ def run() -> int:
     import tempfile as _tf
     import types as _types
 
-    with _tf.TemporaryDirectory() as _td:
-        for _rk in (0, 1):
-            with open(_os2.path.join(_td, f"art_rank{_rk}.pickle"), "wb") as _f:
-                _pk.dump(_build_raw(), _f)
-        with open(_os2.path.join(_td, "artifact_manifest.json"), "w") as _f:
-            _j.dump(
-                {
-                    "schema_version": 1,
-                    "artifacts": [
-                        {
-                            "stem": "art_rank0",
-                            "rank": 0,
-                            "world": 2,
-                            "pickle": "art_rank0.pickle",
-                        },
-                        {
-                            "stem": "art_rank1",
-                            "rank": 1,
-                            "world": 2,
-                            "pickle": "art_rank1.pickle",
-                        },
-                    ],
-                },
-                _f,
-            )
-        _args = _types.SimpleNamespace(
-            artifact_dir=_td,
-            rank=None,
-            out_dir=_td,
+    def _mk_args(_d, rank=None):
+        return _types.SimpleNamespace(
+            artifact_dir=_d,
+            rank=rank,
+            out_dir=_d,
             include_default_pool=False,
             title="t",
             max_rows=50,
@@ -894,7 +1080,47 @@ def run() -> int:
             sidecar=None,
             manifest=None,
         )
-        if _run_artifact_dir(_args) != 0:
+
+    def _side(rk):
+        return {
+            "schema_version": 1,
+            "runner": "standard",
+            "rank": rk,
+            "world": 2,
+            "local_rank": "0",
+            "pid": 100 + rk,
+            "max_entries": 1000,
+            "pool_handle": "(0, 1)",
+            "capture_windows": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "bridges": [],
+        }
+
+    with _tf.TemporaryDirectory() as _td:
+        for _rk in (0, 1):
+            with open(_os2.path.join(_td, f"art_rank{_rk}.pickle"), "wb") as _f:
+                _pk.dump(_build_raw(), _f)
+            with open(_os2.path.join(_td, f"art_rank{_rk}.sidecar.json"), "w") as _f:
+                _j.dump(_side(_rk), _f)
+        with open(_os2.path.join(_td, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": f"art_rank{_rk}",
+                            "rank": _rk,
+                            "world": 2,
+                            "pickle": f"art_rank{_rk}.pickle",
+                            "sidecar": f"art_rank{_rk}.sidecar.json",
+                        }
+                        for _rk in (0, 1)
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td)) != 0:
             failures.append("AC-7: --artifact-dir rank-0 run should succeed")
         if not _os2.path.exists(_os2.path.join(_td, "art_rank0.analysis.json")):
             failures.append("AC-7: rank-0 artifact should be analyzed")
@@ -902,6 +1128,61 @@ def run() -> int:
             failures.append(
                 "AC-7: rank-1 must NOT be analyzed by default (no rank merge)"
             )
+        else:
+            with open(_os2.path.join(_td, "art_rank0.analysis.json")) as _f:
+                _aj = _j.load(_f)
+            if _aj.get("rank") != 0 or _aj.get("world") != 2:
+                failures.append(
+                    "AC-7: artifact-dir output JSON must carry the rank/world header (from sidecar)"
+                )
+
+    # Round-6 AC-7: a missing pickle must not be a false success.
+    with _tf.TemporaryDirectory() as _td2:
+        with open(_os2.path.join(_td2, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank0",
+                            "rank": 0,
+                            "world": 1,
+                            "pickle": "art_rank0.pickle",  # never created
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td2)) == 0:
+            failures.append(
+                "AC-7: artifact-dir with a missing pickle must return nonzero (no false success)"
+            )
+
+    # Round-6 AC-7: rank 0 absent + no --rank must error clearly; explicit --rank works.
+    with _tf.TemporaryDirectory() as _td3:
+        with open(_os2.path.join(_td3, "art_rank1.pickle"), "wb") as _f:
+            _pk.dump(_build_raw(), _f)
+        with open(_os2.path.join(_td3, "artifact_manifest.json"), "w") as _f:
+            _j.dump(
+                {
+                    "schema_version": 1,
+                    "artifacts": [
+                        {
+                            "stem": "art_rank1",
+                            "rank": 1,
+                            "world": 2,
+                            "pickle": "art_rank1.pickle",
+                        }
+                    ],
+                },
+                _f,
+            )
+        if _run_artifact_dir(_mk_args(_td3)) == 0:
+            failures.append(
+                "AC-7: rank 0 absent without --rank must error, not silently pick another rank"
+            )
+        if _run_artifact_dir(_mk_args(_td3, rank=1)) != 0:
+            failures.append("AC-7: explicit --rank 1 should analyze rank 1")
 
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:

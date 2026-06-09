@@ -383,12 +383,14 @@ def _apply_graph_slots(
             "window_key": slot.get("window_key"),
         }
         # 1) contained in an allocation event -> attach the name to that bar.
-        # When the slot carries a window_key, only match a bar inside that window
-        # (disambiguates an address reused across capture windows).
+        # When the slot carries a window_key, only match a bar whose lifetime
+        # OVERLAPS that window (disambiguates an address reused across capture
+        # windows). Overlap (not alloc-start containment) so a buffer allocated
+        # before the window but still live through it is correctly labeled.
         win = (windows_by_key or {}).get(slot.get("window_key"))
 
         def _in_window(a, _win=win):
-            return _win is None or (_win[0] <= a.alloc_ord < _win[1])
+            return _win is None or (a.alloc_ord < _win[1] and _win[0] < a.free_ord)
 
         hit = next(
             (a for a in ordered if a.addr <= p < a.addr + a.size and _in_window(a)),
@@ -431,59 +433,198 @@ def _apply_graph_slots(
     return labels
 
 
+_REPORT_ALLOC_CAP = 25  # per-window allocation records kept (largest first)
+
+
+def _window_metrics(graph: List[Allocation], begin: int, end: int) -> dict:
+    """Per-window stats: counts, bytes, in-window peak, capped allocation records.
+
+    ``peak_live_bytes`` clips each allocation's lifetime to ``[begin, end)`` so it
+    reflects bytes simultaneously live *during this window*, the quantity that
+    actually competes for the shared pool.
+    """
+    inwin = [a for a in graph if a.alloc_ord < end and begin < a.free_ord]
+    sigc: Dict[str, int] = {}
+    for a in inwin:
+        for fl in a.flags:
+            sigc[fl] = sigc.get(fl, 0) + 1
+    deltas: List[Tuple[int, int]] = []
+    for a in inwin:
+        deltas.append((max(a.alloc_ord, begin), a.size))
+        deltas.append((min(a.free_ord, end), -a.size))
+    deltas.sort(key=lambda d: (d[0], -d[1]))
+    live = peak = peak_at = 0
+    for ord_, d in deltas:
+        live += d
+        if live > peak:
+            peak, peak_at = live, ord_
+    top = sorted(inwin, key=lambda a: a.size, reverse=True)
+    records = [
+        {
+            "addr": a.addr,
+            "size": a.size,
+            "label": a.label,
+            "slot_name": a.slot_name,
+            "flags": list(a.flags),
+            "alloc_ord": a.alloc_ord,
+            "free_ord": a.free_ord,
+        }
+        for a in top[:_REPORT_ALLOC_CAP]
+    ]
+    return {
+        "num_allocations": len(inwin),
+        "total_bytes": sum(a.size for a in inwin),
+        "peak_live_bytes": peak,
+        "peak_live_at_ordinal": peak_at,
+        "signature_counts": sigc,
+        "allocations": records,
+        "allocations_omitted": max(0, len(inwin) - len(records)),
+    }
+
+
+def _bridge_persistence(bridges: Optional[List[dict]]) -> List[dict]:
+    """Summarize weak-ref bridge tensors that persist across breakable segments.
+
+    Grouped by ``(num_tokens, from_segment, to_segment)`` — a bridge that keeps a
+    storage alive from one segment into the next holds a pool region that cannot be
+    reused by the later segment's capture. Confidence mirrors the analyzer's S3
+    classification: ``precise`` when the bridge carries an allocator event ordinal.
+    """
+    groups: Dict[Tuple, dict] = {}
+    for b in bridges or []:
+        ev = b.get("event_ord")
+        precise = ev is not None and int(ev) >= 0
+        key = (b.get("num_tokens"), b.get("from_segment"), b.get("to_segment"))
+        g = groups.setdefault(
+            key,
+            {
+                "num_tokens": b.get("num_tokens"),
+                "from_segment": b.get("from_segment"),
+                "to_segment": b.get("to_segment"),
+                "count": 0,
+                "total_bytes": 0,
+                "confidence": "precise" if precise else "approximate",
+                "examples": [],
+            },
+        )
+        g["count"] += 1
+        g["total_bytes"] += int(b.get("storage_nbytes") or 0)
+        if not precise:
+            g["confidence"] = "approximate"  # any non-ordinal bridge -> approximate
+        if len(g["examples"]) < 10:
+            g["examples"].append(
+                {
+                    "storage_data_ptr": b.get("storage_data_ptr"),
+                    "storage_nbytes": b.get("storage_nbytes"),
+                    "name": b.get("name"),
+                    "event_ord": ev,
+                    "confidence": "precise" if precise else "approximate",
+                }
+            )
+    return sorted(groups.values(), key=lambda g: g["count"], reverse=True)
+
+
 def _build_reports(
     allocs: List[Allocation],
     capture_windows_raw: List[dict],
     segment_windows_raw: List[dict],
+    bridges: Optional[List[dict]] = None,
 ) -> dict:
     """Group graph-pool allocations into per-window reports.
 
     standard -> keyed by (batch_size, stream_idx) from capture windows;
     breakable -> keyed by (num_tokens, segment_idx) from segment windows;
     piecewise -> keyed by num_tokens from capture windows.
+
+    Malformed windows (missing/negative/inverted ordinals) are never silently
+    dropped — they are recorded in ``omitted_windows`` with a reason.
     """
     graph = [a for a in allocs if _is_graph_pool(a.pool_id)]
+    omitted: List[dict] = []
 
-    def metrics(begin: int, end: int) -> dict:
-        inwin = [a for a in graph if a.alloc_ord < end and begin < a.free_ord]
-        sigc: Dict[str, int] = {}
-        for a in inwin:
-            for fl in a.flags:
-                sigc[fl] = sigc.get(fl, 0) + 1
-        return {
-            "num_allocations": len(inwin),
-            "total_bytes": sum(a.size for a in inwin),
-            "signature_counts": sigc,
-        }
+    def _range(w: dict, kind: str):
+        b, e = w.get("begin_ord"), w.get("end_ord")
+        if b is None or e is None:
+            omitted.append(
+                {
+                    "kind": kind,
+                    "window_key": w.get("window_key"),
+                    "reason": "missing begin/end ordinal",
+                }
+            )
+            return None
+        b, e = int(b), int(e)
+        if b < 0 or e < 0:
+            omitted.append(
+                {
+                    "kind": kind,
+                    "window_key": w.get("window_key"),
+                    "reason": "negative ordinal (trace length unavailable at capture)",
+                }
+            )
+            return None
+        if b > e:
+            omitted.append(
+                {
+                    "kind": kind,
+                    "window_key": w.get("window_key"),
+                    "reason": f"begin_ord {b} > end_ord {e}",
+                }
+            )
+            return None
+        return b, e
 
     reports: Dict[str, object] = {"standard": [], "breakable": [], "piecewise": []}
     for w in capture_windows_raw:
         runner = w.get("runner")
-        b, e = w.get("begin_ord"), w.get("end_ord")
-        if runner == "breakable" or runner not in reports or b is None or e is None:
+        if runner == "breakable":
+            continue  # breakable is grouped by segment_windows below, not omitted
+        if runner not in reports:
+            omitted.append(
+                {
+                    "kind": "capture",
+                    "window_key": w.get("window_key"),
+                    "reason": f"unknown runner {runner!r}",
+                }
+            )
             continue
+        rng = _range(w, "capture")
+        if rng is None:
+            continue
+        b, e = rng
         reports[runner].append(  # type: ignore[union-attr]
             {
+                "group": {
+                    "runner": runner,
+                    "value": w.get("value"),
+                    "stream_idx": w.get("stream_idx"),
+                },
                 "window_key": w.get("window_key"),
                 "value": w.get("value"),
                 "stream_idx": w.get("stream_idx"),
-                "begin_ord": int(b),
-                "end_ord": int(e),
-                **metrics(int(b), int(e)),
+                "begin_ord": b,
+                "end_ord": e,
+                **_window_metrics(graph, b, e),
             }
         )
     for w in segment_windows_raw:
-        b, e = w.get("begin_ord"), w.get("end_ord")
-        if b is None or e is None:
+        rng = _range(w, "segment")
+        if rng is None:
             continue
+        b, e = rng
         reports["breakable"].append(  # type: ignore[union-attr]
             {
+                "group": {
+                    "runner": "breakable",
+                    "num_tokens": w.get("num_tokens"),
+                    "segment_idx": w.get("segment_idx"),
+                },
                 "window_key": w.get("window_key"),
                 "num_tokens": w.get("num_tokens"),
                 "segment_idx": w.get("segment_idx"),
-                "begin_ord": int(b),
-                "end_ord": int(e),
-                **metrics(int(b), int(e)),
+                "begin_ord": b,
+                "end_ord": e,
+                **_window_metrics(graph, b, e),
             }
         )
     breakable_caps = [w for w in capture_windows_raw if w.get("runner") == "breakable"]
@@ -496,6 +637,8 @@ def _build_reports(
             else "no breakable windows"
         )
     )
+    reports["breakable_bridges"] = _bridge_persistence(bridges)
+    reports["omitted_windows"] = omitted
     return reports
 
 
@@ -697,7 +840,9 @@ def analyze(
         graph_slot_labels = _apply_graph_slots(
             snap, allocs, graph_slots, windows_by_key
         )
-        reports = _build_reports(allocs, capture_windows_raw, segment_windows_raw)
+        reports = _build_reports(
+            allocs, capture_windows_raw, segment_windows_raw, eff_bridges
+        )
 
         shown = (
             allocs
@@ -1213,7 +1358,13 @@ def _run_one(
 
 
 def _run_artifact_dir(args) -> int:
-    """Analyze a rank's artifacts from artifact_manifest.json (rank-0 default)."""
+    """Analyze a rank's artifacts from artifact_manifest.json (rank-0 default).
+
+    Manifest-driven and fail-safe: each chosen entry's pickle + sidecar paths come
+    from the manifest. Never reports success without actually analyzing a selected
+    artifact — returns nonzero if none analyze. When rank 0 is absent and ``--rank``
+    is omitted, fails clearly rather than silently analyzing a different rank.
+    """
     man_path = os.path.join(args.artifact_dir, "artifact_manifest.json")
     if not os.path.exists(man_path):
         print(f"no artifact_manifest.json in {args.artifact_dir}", file=sys.stderr)
@@ -1231,8 +1382,15 @@ def _run_artifact_dir(args) -> int:
         return 2
     if args.rank is not None:
         sel = str(args.rank)
+    elif "0" in ranks:
+        sel = "0"
     else:
-        sel = "0" if "0" in ranks else ranks[0]
+        print(
+            f"rank 0 absent (available ranks: {ranks}); pass --rank to choose one "
+            "explicitly — ranks are never merged",
+            file=sys.stderr,
+        )
+        return 2
     chosen = [a for a in arts if str(a.get("rank")) == sel]
     if not chosen:
         print(f"no artifacts for rank {sel}; available ranks: {ranks}", file=sys.stderr)
@@ -1242,14 +1400,30 @@ def _run_artifact_dir(args) -> int:
         f"({len(chosen)} artifact(s)) — ranks are never merged"
     )
     rc = 0
+    analyzed = 0
     for a in chosen:
-        pkl = os.path.join(
-            args.artifact_dir, a.get("pickle") or (a.get("stem", "") + ".pickle")
-        )
+        stem = a.get("stem", "")
+        pkl = os.path.join(args.artifact_dir, a.get("pickle") or (stem + ".pickle"))
         if not os.path.exists(pkl):
-            print(f"WARNING: missing pickle {pkl}", file=sys.stderr)
+            print(f"ERROR: missing pickle {pkl}", file=sys.stderr)
+            rc = rc or 2
             continue
-        rc = _run_one(pkl, args) or rc
+        side = os.path.join(
+            args.artifact_dir, a.get("sidecar") or (stem + ".sidecar.json")
+        )
+        one_rc = _run_one(
+            pkl, args, sidecar_override=side if os.path.exists(side) else None
+        )
+        if one_rc == 0:
+            analyzed += 1
+        else:
+            rc = rc or one_rc
+    if analyzed == 0:
+        print(
+            f"ERROR: analyzed 0 of {len(chosen)} selected artifact(s) for rank {sel}",
+            file=sys.stderr,
+        )
+        return rc or 2
     return rc
 
 

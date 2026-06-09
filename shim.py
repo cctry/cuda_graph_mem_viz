@@ -48,7 +48,7 @@ _capture_windows: list = []
 _segment_windows: list = []
 _graph_slots: list = []
 _pending_segments: list = []  # stack of in-flight segment records
-_slots_done = False
+_slots_seen: set = set()  # (window_key, storage_data_ptr) already recorded
 _cur_num_tokens: contextvars.ContextVar = contextvars.ContextVar(
     "cg_cur_num_tokens", default=None
 )
@@ -58,13 +58,12 @@ _cur_window_key: contextvars.ContextVar = contextvars.ContextVar(
 
 
 def _reset_accumulators() -> None:
-    global _slots_done
     _bridges.clear()
     _capture_windows.clear()
     _segment_windows.clear()
     _graph_slots.clear()
     _pending_segments.clear()
-    _slots_done = False
+    _slots_seen.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -172,10 +171,14 @@ def _stop_recording() -> None:
 
 
 def _extract_graph_slots(runner) -> None:
-    """Record named static buffers from the runner's buffer registry (once)."""
-    global _slots_done
-    if _slots_done:
-        return
+    """Record named static buffers from the runner's buffer registry.
+
+    Called once per capture window. A static buffer is recorded in EVERY window it
+    is observed in (tagged with that window's key), deduped by
+    ``(window_key, storage_data_ptr)`` so one window never double-counts a buffer.
+    Recording per window lets the analyzer match a buffer that stays live across
+    many windows via lifetime/window overlap (not just the first window).
+    """
     reg = getattr(runner, "buffer_registry", None)
     if reg is None:
         return
@@ -185,6 +188,7 @@ def _extract_graph_slots(runner) -> None:
         names = list(reg.slot_names())
     except Exception:
         names = []
+    wkey = _cur_window_key.get()
     for name in names:
         try:
             slot = reg.get_slot(name)
@@ -192,20 +196,24 @@ def _extract_graph_slots(runner) -> None:
             if buf is None or not torch.is_tensor(buf):
                 continue
             st = buf.untyped_storage()
+            sptr = st.data_ptr()
+            dedupe = (wkey, sptr)
+            if dedupe in _slots_seen:
+                continue
+            _slots_seen.add(dedupe)
             _graph_slots.append(
                 {
                     "name": str(name),
                     "tensor_data_ptr": buf.data_ptr(),
-                    "storage_data_ptr": st.data_ptr(),
+                    "storage_data_ptr": sptr,
                     "nbytes": st.nbytes(),
                     "shape": list(buf.shape),
                     "dtype": str(buf.dtype),
-                    "window_key": _cur_window_key.get(),
+                    "window_key": wkey,
                 }
             )
         except Exception:
             continue
-    _slots_done = True
 
 
 def _upsert_manifest(out, stem, runner, rank, world, local, pid) -> None:
