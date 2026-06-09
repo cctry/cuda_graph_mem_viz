@@ -372,6 +372,152 @@ def run() -> int:
     if zres.get("lifetime_available"):
         failures.append("AC-3: snapshot missing alloc size must disable lifetime")
 
+    # Round-3 AC-5: time-windowed bridge matching disambiguates ADDRESS REUSE.
+    P = GP + 4 * MiB
+    slot_blk = GP + 32 * MiB
+    reuse_segments = [
+        {
+            "address": GP,
+            "total_size": 64 * MiB,
+            "stream": 1,
+            "segment_pool_id": (0, 1),
+            "segment_type": "large",
+            "blocks": [
+                {
+                    "address": P,
+                    "size": 8 * MiB,
+                    "requested_size": 8 * MiB,
+                    "state": "inactive",
+                    "frames": [],
+                },
+                {
+                    "address": slot_blk,
+                    "size": 8 * MiB,
+                    "requested_size": 8 * MiB,
+                    "state": "active_allocated",
+                    "frames": _frame("slot_buf"),
+                },
+                {
+                    "address": slot_blk + 8 * MiB,
+                    "size": 48 * MiB,
+                    "requested_size": 0,
+                    "state": "inactive",
+                    "frames": [],
+                },
+            ],
+        }
+    ]
+    rev = []
+
+    def _a(addr, size, name):
+        rev.append(
+            {
+                "action": "alloc",
+                "addr": addr,
+                "size": size,
+                "time_us": len(rev) * 10,
+                "frames": _frame(name),
+            }
+        )
+
+    def _f(addr):
+        rev.append(
+            {
+                "action": "free_requested",
+                "addr": addr,
+                "size": 0,
+                "time_us": len(rev) * 10,
+                "frames": [],
+            }
+        )
+
+    _a(P, 8 * MiB, "A")  # ord0 -> A lifetime [0, 1)
+    _f(P)  # ord1
+    _a(GP + 20 * MiB, 4 * MiB, "filler")  # ord2
+    _a(P, 8 * MiB, "B")  # ord3 -> reuse of P, never freed [3, END)
+    reuse_raw = {
+        "segments": reuse_segments,
+        "device_traces": [rev],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    sidecar = {
+        "schema_version": 1,
+        "runner": "breakable",
+        "rank": 0,
+        "world": 1,
+        "local_rank": "0",
+        "pid": 1,
+        "max_entries": 1000,
+        "pool_handle": "(0, 1)",
+        "capture_windows": [],
+        "segment_windows": [],
+        "graph_slots": [
+            {
+                "name": "slot_buf",
+                "storage_data_ptr": slot_blk,
+                "nbytes": 8 * MiB,
+                "shape": [1],
+                "dtype": "torch.int32",
+            },
+            {
+                "name": "ghost",
+                "storage_data_ptr": 0xDEADBEEF000,
+                "nbytes": 1024,
+                "shape": [1],
+                "dtype": "torch.int8",
+            },
+        ],
+        "bridges": [
+            {
+                "storage_data_ptr": P,
+                "storage_nbytes": 8 * MiB,
+                "from_segment": 0,
+                "to_segment": 1,
+                "event_ord": 0,
+                "name": "bridge.A",
+            },
+        ],
+    }
+    wres = analyze(normalize(reuse_raw), sidecar=sidecar)
+    by_ord = {b["alloc_ord"]: b for b in wres["bars"]}
+    a_bar, b_bar = by_ord.get(0), by_ord.get(3)
+    if (
+        a_bar is None
+        or "S3_non_reusable" not in a_bar["flags"]
+        or a_bar.get("confidence") != "precise"
+    ):
+        failures.append(
+            "AC-5: bridge event_ord=0 must precisely flag the allocation live at ord 0"
+        )
+    if b_bar is not None and "S3_non_reusable" in b_bar["flags"]:
+        failures.append(
+            "AC-5: reused-address allocation outside the bridge ordinal must NOT be flagged precise"
+        )
+    if wres["signatures_present"].get("S3_approx"):
+        failures.append(
+            "AC-5: event-windowed bridge match must be precise (S3_approx False)"
+        )
+    if wres["signatures_present"].get("S3_bridge_match") != "event-windowed":
+        failures.append("AC-5: bridge match method should be event-windowed")
+    if any("source" not in b or "confidence" not in b for b in wres["bars"]):
+        failures.append("AC-5: every bar must carry source/confidence provenance")
+    labels = {lb["name"]: lb for lb in wres["graph_slot_labels"]}
+    if labels.get("ghost", {}).get("source") != "sidecar-only":
+        failures.append(
+            "AC-5: a GraphSlot absent from the snapshot must be sidecar-only"
+        )
+    if labels.get("slot_buf", {}).get("source") != "snapshot-backed":
+        failures.append(
+            "AC-5: a GraphSlot present in a snapshot block must be snapshot-backed"
+        )
+    if wres["sidecar_only_label_count"] != 1:
+        failures.append(
+            f"AC-5: expected 1 sidecar-only label, got {wres['sidecar_only_label_count']}"
+        )
+    if (wres.get("sidecar_meta") or {}).get("schema_version") != 1:
+        failures.append("AC-5: sidecar schema_version must be surfaced in sidecar_meta")
+
     # Fail-closed: malformed snapshot must raise SchemaError.
     try:
         normalize(

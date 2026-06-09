@@ -47,6 +47,8 @@ class Allocation:
     pool_id: Optional[object]
     label: str
     flags: List[str] = field(default_factory=list)
+    slot_name: Optional[str] = None
+    bridge_conf: Optional[str] = None  # "precise" | "approximate" | None
 
     @property
     def span(self) -> int:
@@ -241,24 +243,74 @@ def _flag_signatures(
     return used
 
 
-def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> Tuple[int, int]:
-    """Mark the allocation backing each weak-ref bridge tensor (precise S3).
+def _flag_bridge(a: Allocation, b: dict, confidence: str) -> None:
+    if "S3_non_reusable" not in a.flags:
+        a.flags.append("S3_non_reusable")
+    if "S3_non_reusable_approx" in a.flags:
+        a.flags.remove("S3_non_reusable_approx")
+    a.label = f"{a.label} [bridge s{b.get('from_segment')}->{b.get('to_segment')}]"
+    a.bridge_conf = confidence
 
-    Bridges are matched by *storage* data_ptr contained in an allocation's block
-    range (allocator blocks can be larger than the tensor storage). A bridge
-    address is reused across the ~per-token-size captures, so many allocations
-    contain it; rather than flag them all (over-attribution) or just the first
-    (undercount), we flag ONE representative per unique bridge address: the
-    longest-lived containing allocation (preferring one that is never freed
-    during capture, i.e. the persistent cross-segment region), then largest.
 
-    Exact per-instance time-windowing would need a global event ordinal stamped
-    at each break, but torch exposes no cheap trace-length counter (only the
-    O(n) `_snapshot()`), so this representative selection is the cheap, honest
-    approximation. Returns (allocations_flagged, unique_bridge_ptrs_matched).
+def _bridges_have_ordinals(bridges: List[dict]) -> bool:
+    return any(
+        b.get("event_ord") is not None and int(b.get("event_ord", -1)) >= 0
+        for b in bridges
+    )
+
+
+def _apply_bridges(
+    allocs: List[Allocation], bridges: List[dict]
+) -> Tuple[bool, int, int]:
+    """Attribute weak-ref bridge tensors to the allocation they actually back.
+
+    Precise mode (bridge records carry an allocator ``event_ord``): a bridge is
+    joined to the allocation whose address range contains the bridge storage AND
+    whose lifetime ``[alloc_ord, free_ord)`` contains the bridge ``event_ord``.
+    This disambiguates address reuse across capture windows.
+
+    Approximate fallback (no ``event_ord``): one representative allocation per
+    unique bridge address (never-freed > longest span > largest). Reported as
+    approximate, never precise.
+
+    Returns (precise, allocations_flagged, unique_bridge_ptrs_matched).
     """
-    import bisect
     from collections import defaultdict
+
+    if _bridges_have_ordinals(bridges):
+        by_addr: Dict[int, List[Allocation]] = defaultdict(list)
+        for a in allocs:
+            by_addr[a.addr].append(a)
+        flagged: set = set()
+        matched: set = set()
+        for b in bridges:
+            p, e = b.get("storage_data_ptr"), b.get("event_ord")
+            if p is None or e is None:
+                continue
+            p, e = int(p), int(e)
+            hit = next(
+                (a for a in by_addr.get(p, []) if a.alloc_ord <= e < a.free_ord), None
+            )
+            if hit is None:  # containment fallback (rare; storage != block base)
+                hit = next(
+                    (
+                        a
+                        for a in allocs
+                        if a.addr <= p < a.addr + a.size
+                        and a.alloc_ord <= e < a.free_ord
+                    ),
+                    None,
+                )
+            if hit is None:
+                continue
+            matched.add(p)
+            if id(hit) not in flagged:
+                _flag_bridge(hit, b, "precise")
+                flagged.add(id(hit))
+        return True, len(flagged), len(matched)
+
+    # Approximate: representative per unique bridge address.
+    import bisect
 
     by_ptr: Dict[int, dict] = {}
     for b in bridges:
@@ -272,22 +324,58 @@ def _apply_bridges(allocs: List[Allocation], bridges: List[dict]) -> Tuple[int, 
         hi = bisect.bisect_left(ptr_list, a.addr + a.size)
         for p in ptr_list[lo:hi]:
             candidates[p].append(a)
-
-    flagged: set = set()
+    flagged_repr: set = set()
     for p, cands in candidates.items():
         best = max(cands, key=lambda a: (a.never_freed, a.span, a.size))
-        if id(best) in flagged:
+        if id(best) in flagged_repr:
             continue
-        b = by_ptr[p]
-        if "S3_non_reusable" not in best.flags:
-            best.flags.append("S3_non_reusable")
-        if "S3_non_reusable_approx" in best.flags:
-            best.flags.remove("S3_non_reusable_approx")
-        best.label = (
-            f"{best.label} [bridge s{b.get('from_segment')}->{b.get('to_segment')}]"
+        _flag_bridge(best, by_ptr[p], "approximate")
+        flagged_repr.add(id(best))
+    return False, len(flagged_repr), len(candidates)
+
+
+def _apply_graph_slots(
+    snap: NormalizedSnapshot, allocs: List[Allocation], graph_slots: List[dict]
+) -> List[dict]:
+    """Attach GraphSlot names to allocations and report label provenance.
+
+    A slot is ``snapshot-backed`` when its storage address is found in a snapshot
+    allocation (event) or block (layout); ``sidecar-only`` when the buffer is
+    absent from the snapshot entirely (e.g. allocated before recording started).
+    """
+    from collections import defaultdict
+
+    by_addr: Dict[int, List[Allocation]] = defaultdict(list)
+    for a in allocs:
+        by_addr[a.addr].append(a)
+    block_ranges = [
+        (b.address, b.address + b.size)
+        for s in snap.segments
+        for b in s.blocks
+        if b.address is not None
+    ]
+    labels: List[dict] = []
+    for slot in graph_slots:
+        p = slot.get("storage_data_ptr")
+        if p is None:
+            continue
+        p = int(p)
+        in_event = by_addr.get(p)
+        in_block = any(lo <= p < hi for lo, hi in block_ranges)
+        source = "snapshot-backed" if (in_event or in_block) else "sidecar-only"
+        if in_event:
+            for a in in_event:
+                a.slot_name = slot.get("name")
+        labels.append(
+            {
+                "name": slot.get("name"),
+                "storage_data_ptr": p,
+                "nbytes": slot.get("nbytes"),
+                "dtype": slot.get("dtype"),
+                "source": source,
+            }
         )
-        flagged.add(id(best))
-    return len(flagged), len(candidates)
+    return labels
 
 
 def _resolve_availability(snap: NormalizedSnapshot, manifest: Optional[dict]) -> dict:
@@ -343,11 +431,23 @@ def analyze(
     include_default_pool: bool = False,
     window_boundaries: Optional[List[int]] = None,
     bridges: Optional[List[dict]] = None,
+    sidecar: Optional[dict] = None,
     manifest: Optional[dict] = None,
     s2_size_pctile: float = 0.95,
     s2_pool_fraction: float = 0.10,
     s1_span_pctile: float = 0.75,
 ) -> dict:
+    sc = sidecar or {}
+    eff_bridges = sc.get("bridges") if sc.get("bridges") is not None else bridges
+    graph_slots = sc.get("graph_slots") or []
+    capture_windows = [
+        (int(w["begin_ord"]), int(w["end_ord"]))
+        for w in (sc.get("capture_windows") or [])
+        if w.get("begin_ord") is not None
+        and w.get("end_ord") is not None
+        and int(w["begin_ord"]) >= 0
+    ]
+
     avail = _resolve_availability(snap, manifest)
     avail_source = avail["source"]
 
@@ -387,6 +487,8 @@ def analyze(
 
     lifetime_available = history_ok
     bridges_matched = 0
+    bridge_precise = False
+    graph_slot_labels: List[dict] = []
     if lifetime_available:
         allocs, end = _extract_allocations(snap)
         signatures = _flag_signatures(
@@ -397,29 +499,53 @@ def analyze(
             s2_pool_fraction,
             s1_span_pctile,
         )
-        bridge_allocs_flagged, bridge_ptrs_matched = (
-            _apply_bridges(allocs, bridges) if bridges else (0, 0)
+        bridge_precise, bridge_allocs_flagged, bridge_ptrs_matched = (
+            _apply_bridges(allocs, eff_bridges) if eff_bridges else (False, 0, 0)
         )
         bridges_matched = bridge_ptrs_matched
-        if bridges:
+
+        # Precise cross-graph from sidecar capture windows: an allocation whose
+        # lifetime overlaps more than one capture window cannot be reused by
+        # another graph sharing the pool.
+        window_spanning = 0
+        if capture_windows:
+            for a in allocs:
+                if not _is_graph_pool(a.pool_id):
+                    continue
+                overlaps = 0
+                for lo, hi in capture_windows:
+                    if a.alloc_ord < hi and lo < a.free_ord:
+                        overlaps += 1
+                        if overlaps > 1:
+                            break
+                if overlaps > 1:
+                    if "S3_non_reusable" not in a.flags:
+                        a.flags.append("S3_non_reusable")
+                    if "S3_non_reusable_approx" in a.flags:
+                        a.flags.remove("S3_non_reusable_approx")
+                    if a.bridge_conf is None:
+                        a.bridge_conf = "precise-window"
+                    window_spanning += 1
+
+        if eff_bridges:
             signatures["S3_non_reusable"] = (
                 signatures.get("S3_non_reusable", False) or bridge_allocs_flagged > 0
             )
-            # Honest labeling: address-only representative matching is NOT precise
-            # (a bridge address is reused across captures). Stay approximate until
-            # event-window matching lands (Round 2). Precise only with explicit
-            # capture-window boundaries.
-            signatures["S3_approx"] = window_boundaries is None
-            signatures["S3_bridge_match"] = "address-only-representative"
-            signatures["S3_bridge_ptrs_matched"] = bridge_ptrs_matched
-            signatures["S3_bridge_ptrs_total"] = len(
-                {
-                    int(b["storage_data_ptr"])
-                    for b in bridges
-                    if b.get("storage_data_ptr") is not None
-                }
+            signatures["S3_bridge_match"] = (
+                "event-windowed" if bridge_precise else "address-only-representative"
             )
+            signatures["S3_bridge_ptrs_matched"] = bridge_ptrs_matched
             signatures["S3_bridge_allocs_flagged"] = bridge_allocs_flagged
+        signatures["S3_window_spanning"] = window_spanning
+        # Cross-graph is precise when matched by event-windowed bridges or by
+        # capture-window overlap; otherwise it stays approximate.
+        precise_cross = (
+            bridge_precise or bool(capture_windows) or (window_boundaries is not None)
+        )
+        signatures["S3_approx"] = not precise_cross
+
+        graph_slot_labels = _apply_graph_slots(snap, allocs, graph_slots)
+
         shown = (
             allocs
             if include_default_pool
@@ -438,10 +564,15 @@ def analyze(
                 "pool_id": a.pool_id,
                 "label": a.label,
                 "flags": a.flags,
+                "slot_name": a.slot_name,
+                "source": "snapshot-backed",
+                "confidence": a.bridge_conf or "exact",
             }
             for a in sorted(shown, key=lambda x: x.alloc_ord)
         ]
         features_used += ["capture_order_lifetime", "gantt", "signatures"]
+        if eff_bridges or graph_slots or capture_windows:
+            features_used.append("sidecar_join")
         gantt_available = True
     else:
         # AC-1.1 / AC-9 negative: no allocation event stream -> degrade. Do not
@@ -460,10 +591,21 @@ def analyze(
             if include_default_pool or s["is_graph_pool"]
         )
         peak_at = 0
+        fa = snap.field_availability
+        snap_missing = [
+            k
+            for k in ("device_traces", "trace_action", "trace_addr", "trace_size")
+            if not fa.get(k)
+        ]
+        reason = (
+            "snapshot missing " + ", ".join(snap_missing)
+            if snap_missing
+            else "manifest marks trace fields unavailable"
+        )
         features_skipped += [
-            "capture_order_lifetime (no device_traces history)",
-            "gantt (no device_traces history)",
-            "signatures (no device_traces history)",
+            f"capture_order_lifetime ({reason})",
+            f"gantt ({reason})",
+            f"signatures ({reason})",
         ]
         gantt_available = False
 
@@ -472,12 +614,20 @@ def analyze(
         for fl in b["flags"]:
             sig_counts[fl] = sig_counts.get(fl, 0) + 1
 
+    spanning = signatures.get("S3_window_spanning", 0) if lifetime_available else 0
     if not lifetime_available:
         cross = "unavailable (no allocation history)"
-    elif bridges:
+    elif bridge_precise:
+        extra = f", {spanning} window-spanning" if capture_windows else ""
+        cross = f"precise (event-windowed match of {bridges_matched} bridge storages{extra})"
+    elif capture_windows:
+        cross = (
+            f"precise (capture-window overlap: {spanning} allocations span >1 window)"
+        )
+    elif eff_bridges:
         cross = (
             f"approximate (address-only representative match of {bridges_matched} "
-            "bridge storages; event-window matching pending Round 2)"
+            "bridge storages; sidecar has no event ordinals)"
         )
     elif window_boundaries is not None:
         cross = "precise (capture-window boundaries provided)"
@@ -506,6 +656,28 @@ def analyze(
         "lifetime_axis": "capture_order_event_ordinal",
         "bridges_matched": bridges_matched,
         "cross_graph_signature": cross,
+        "graph_slot_labels": graph_slot_labels,
+        "sidecar_only_label_count": sum(
+            1 for s in graph_slot_labels if s["source"] == "sidecar-only"
+        ),
+        "capture_window_count": len(capture_windows),
+        "sidecar_meta": (
+            {
+                k: sc.get(k)
+                for k in (
+                    "schema_version",
+                    "runner",
+                    "rank",
+                    "world",
+                    "local_rank",
+                    "pid",
+                    "max_entries",
+                    "pool_handle",
+                )
+            }
+            if sc
+            else None
+        ),
     }
 
 
@@ -804,6 +976,12 @@ def main() -> int:
         help="capability manifest from validator.py (default: sibling capability_manifest.json). "
         "Gates layout/lifetime/Gantt; absent fields fail closed or degrade.",
     )
+    parser.add_argument(
+        "--sidecar",
+        default=None,
+        help="capture sidecar from the shim (default: sibling .sidecar.json). Provides "
+        "capture/segment windows, GraphSlot map, and event-ord bridges for precise joins.",
+    )
     args = parser.parse_args()
 
     try:
@@ -839,11 +1017,32 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    sidecar = None
+    sidecar_path = args.sidecar or (
+        os.path.splitext(args.snapshot)[0] + ".sidecar.json"
+    )
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path) as f:
+                sidecar = json.load(f)
+            print(
+                f"loaded sidecar (schema_version={sidecar.get('schema_version')}, "
+                f"windows={len(sidecar.get('capture_windows') or [])}, "
+                f"segments={len(sidecar.get('segment_windows') or [])}, "
+                f"slots={len(sidecar.get('graph_slots') or [])}, "
+                f"bridges={len(sidecar.get('bridges') or [])}) from {sidecar_path}"
+            )
+        except Exception as e:
+            print(
+                f"WARNING: could not read sidecar {sidecar_path}: {e}", file=sys.stderr
+            )
+
     try:
         result = analyze(
             snap,
             include_default_pool=args.include_default_pool,
             bridges=bridges,
+            sidecar=sidecar,
             manifest=manifest,
         )
     except SchemaError as e:
@@ -882,6 +1081,12 @@ def main() -> int:
             f"pool_bloating={sig.get('S2_pool_bloating')} "
             f"non_reusable={sig.get('S3_non_reusable')} (approx={sig.get('S3_approx')})"
         )
+        print(f"cross-graph: {result['cross_graph_signature']}")
+        if result.get("graph_slot_labels"):
+            print(
+                f"graph slots: {len(result['graph_slot_labels'])} "
+                f"({result['sidecar_only_label_count']} sidecar-only)"
+            )
     else:
         print(
             "Gantt/lifetime DISABLED (no allocation history) — degraded layout-only report."
