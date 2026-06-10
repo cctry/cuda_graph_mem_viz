@@ -1,17 +1,21 @@
-"""Serve cg_mem_inspect traces so the Perfetto web UI renders the Gantt.
+"""Serve cg_mem_inspect traces so the Perfetto web UI renders the memory map.
 
-Perfetto (https://ui.perfetto.dev) can open a trace straight from a URL when the
+Perfetto (https://ui.perfetto.dev) opens a trace straight from a URL when the
 hosting server sends CORS headers. This starts such a server over the artifacts
-directory and prints a ready-to-open ui.perfetto.dev deep link for every
-``*.perfetto.json`` — so the tensor-lifetime Gantt shows up in the Perfetto web
-frontend (with zoom / search / filter), no manual file upload needed.
+directory and prints a ready-to-open ``ui.perfetto.dev/#!/?url=...`` deep link for
+every ``*.perfetto.json`` — no manual file upload needed.
 
 Run:
-    uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py [--port 8099] [--host <fqdn>]
+    uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py [--port 8099]
 
-Then click the printed link in a browser that can reach this host. If your
-browser cannot reach the host directly, download the .perfetto.json and drag it
-onto https://ui.perfetto.dev instead.
+The link defaults to ``http://localhost:<port>`` because Perfetto's HTTPS page can
+only fetch an ``http://`` trace from **localhost** (a remote host is blocked as
+mixed content). From your laptop, forward the port and click the link:
+    ssh -L 8099:localhost:8099 <this-devserver>
+If your browser can reach this machine directly, pass ``--host <fqdn>`` instead.
+
+``--link-only`` prints the links and exits (no server); or just drag a
+``*.perfetto.json`` onto https://ui.perfetto.dev.
 """
 
 from __future__ import annotations
@@ -72,10 +76,17 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument(
         "--host",
-        default=os.environ.get("CG_MEM_SERVE_HOST") or socket.getfqdn(),
-        help="hostname to embed in the Perfetto link (must be reachable from your browser)",
+        default=os.environ.get("CG_MEM_SERVE_HOST") or "localhost",
+        help="host embedded in the Perfetto link. Default 'localhost' (forward the "
+        "port with `ssh -L <port>:localhost:<port> <devserver>`); pass an FQDN your "
+        "browser can reach directly to skip the tunnel.",
     )
     ap.add_argument("--dir", default=_ARTIFACTS)
+    ap.add_argument(
+        "--link-only",
+        action="store_true",
+        help="print the Perfetto deep links and exit (do not start the server)",
+    )
     args = ap.parse_args()
 
     if not os.path.isdir(args.dir):
@@ -84,14 +95,31 @@ def main() -> int:
     os.chdir(args.dir)
     traces = sorted(f for f in os.listdir(".") if f.endswith(".perfetto.json"))
 
-    print(f"[serve] serving {args.dir} on [::]:{args.port} (CORS enabled)")
     if not traces:
         print(
-            "[serve] no *.perfetto.json yet — run the analyzer first.", file=sys.stderr
+            f"[serve] no *.perfetto.json in {args.dir} — run the analyzer first.",
+            file=sys.stderr,
         )
+        return 2
     for f in traces:
         print(
             f"\n  {f}\n  → open in Perfetto web:\n    {_perfetto_link(args.host, args.port, f)}\n"
+        )
+
+    if args.link_only:
+        if args.host in ("localhost", "127.0.0.1", "::1"):
+            print(
+                f"[serve] start the server (no --link-only) or forward the port, then "
+                f"open the link(s):\n    ssh -L {args.port}:localhost:{args.port} "
+                f"{socket.getfqdn()}"
+            )
+        return 0
+
+    print(f"[serve] serving {args.dir} on [::]:{args.port} (CORS enabled)")
+    if args.host in ("localhost", "127.0.0.1", "::1"):
+        print(
+            f"[serve] from your browser's machine, forward the port first:\n"
+            f"    ssh -L {args.port}:localhost:{args.port} {socket.getfqdn()}"
         )
     print("[serve] Ctrl-C to stop.")
     try:

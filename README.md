@@ -92,15 +92,25 @@ Useful flags: `--include-default-pool`, `--max-rows N` (HTML), `--sidecar <path>
 
 ## 3. View the memory map (Perfetto)
 
-**Perfetto web (interactive — recommended):**
+**Perfetto web (interactive — recommended):** `serve.py` hosts the traces with CORS
+and prints a ready-to-click `https://ui.perfetto.dev/#!/?url=...` deep link per trace.
+
 ```bash
-uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py --host <host-reachable-from-your-browser>
+# On the devserver:
+uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py      # serves ./cg_mem_artifacts on :8099
+# On your laptop, forward the port, then click the printed link:
+ssh -L 8099:localhost:8099 <devserver>
 ```
-Click the printed `https://ui.perfetto.dev/#!/?url=...` link. (Or drag the
-`*.perfetto.json` onto https://ui.perfetto.dev directly.) Each row (track) is a
-capture/segment window in time order; each slice is a tensor placed at its pool
-offset with width = its size. Zoom/search/filter over all allocations (e.g. search
-`fused_norm_residual` for persistent bridges). Reading conventions:
+The link defaults to `http://localhost:8099` because Perfetto's HTTPS page can only
+fetch an `http://` trace from **localhost** (a remote host is blocked as mixed
+content) — hence the SSH tunnel. If your browser can reach the devserver directly,
+use `serve.py --host <fqdn>` instead. `serve.py --link-only` just prints the links
+(no server), and you can always drag a `*.perfetto.json` onto https://ui.perfetto.dev.
+
+Each row (track) is a capture/segment window in time order; each slice is a tensor
+placed at its pool offset with width = its size. Zoom/search/filter over all
+allocations (e.g. search `fused_norm_residual` for persistent bridges). Reading
+conventions:
 - **down a memory column** (same x across stacked tracks) → how that region is
   reused by different tensors over capture time;
 - **across a slice** → the tensor's size.
