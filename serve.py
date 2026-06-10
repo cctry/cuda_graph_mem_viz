@@ -21,10 +21,14 @@ If your browser can reach this machine directly, pass ``--host <fqdn>`` instead.
 from __future__ import annotations
 
 import argparse
+import gzip
 import http.server
 import os
+import shutil
 import socket
+import subprocess
 import sys
+import time
 import urllib.parse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +75,53 @@ def _perfetto_link(host: str, port: int, filename: str) -> str:
     return "https://ui.perfetto.dev/#!/?url=" + urllib.parse.quote(url, safe="")
 
 
+def _kernelhub_link(bucket: str, trace_path: str) -> str:
+    """internalfb kernelhub Perfetto viewer link for a Manifold-hosted trace."""
+    return (
+        "https://www.internalfb.com/intern/kernelhub/perfetto/"
+        f"?bucket={bucket}&trace_path={trace_path.replace('/', '%2F')}"
+    )
+
+
+def _publish(traces, bucket: str, subdir: str) -> int:
+    """Gzip each trace, upload to Manifold under <bucket>/<subdir>, and print an
+    internalfb kernelhub Perfetto link (no local server / SSH tunnel needed)."""
+    try:
+        subprocess.run(
+            ["manifold", "mkdirs", f"{bucket}/{subdir}"], capture_output=True
+        )
+    except FileNotFoundError:
+        print("[serve] 'manifold' CLI not found — cannot --publish.", file=sys.stderr)
+        return 2
+    published = 0
+    for f in traces:
+        gz = f + ".gz"
+        with open(f, "rb") as src, gzip.open(gz, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        dest = f"{subdir}/{f}.gz"
+        try:
+            r = subprocess.run(
+                ["manifold", "put", gz, f"{bucket}/{dest}", "--overwrite"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        finally:
+            os.remove(gz)
+        if r.returncode != 0:
+            print(
+                f"[serve] manifold upload failed for {f}: {r.stderr[:200]}",
+                file=sys.stderr,
+            )
+            continue
+        published += 1
+        print(
+            f"\n  {f}\n  → Perfetto (kernelhub, no tunnel):\n"
+            f"    {_kernelhub_link(bucket, dest)}\n"
+        )
+    return 0 if published else 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=8099)
@@ -87,6 +138,15 @@ def main() -> int:
         action="store_true",
         help="print the Perfetto deep links and exit (do not start the server)",
     )
+    ap.add_argument(
+        "--publish",
+        action="store_true",
+        help="upload each trace to Manifold and print an internalfb kernelhub "
+        "Perfetto link (no local server / SSH tunnel needed)",
+    )
+    ap.add_argument(
+        "--bucket", default="gpu_traces", help="Manifold bucket for --publish"
+    )
     args = ap.parse_args()
 
     if not os.path.isdir(args.dir):
@@ -101,6 +161,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.publish:
+        host = socket.gethostname().split(".")[0]
+        subdir = f"tree/traces/cg_mem_inspect/{time.strftime('%Y%m%d-%H%M%S')}/{host}"
+        return _publish(traces, args.bucket, subdir)
+
     for f in traces:
         print(
             f"\n  {f}\n  → open in Perfetto web:\n    {_perfetto_link(args.host, args.port, f)}\n"

@@ -92,20 +92,29 @@ Useful flags: `--include-default-pool`, `--max-rows N` (HTML), `--sidecar <path>
 
 ## 3. View the memory map (Perfetto)
 
-**Perfetto web (interactive — recommended):** `serve.py` hosts the traces with CORS
-and prints a ready-to-click `https://ui.perfetto.dev/#!/?url=...` deep link per trace.
+**Manifold + internal kernelhub link (recommended — no server/tunnel):** uploads each
+trace to Manifold and prints an `internalfb.com/intern/kernelhub/perfetto/?bucket=...`
+link you can click from anywhere.
 
 ```bash
-# On the devserver:
-uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py      # serves ./cg_mem_artifacts on :8099
-# On your laptop, forward the port, then click the printed link:
-ssh -L 8099:localhost:8099 <devserver>
+uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py --publish
+#   → https://www.internalfb.com/intern/kernelhub/perfetto/?bucket=gpu_traces&trace_path=tree%2F...%2Fcgmem_..._breakable.perfetto.json.gz
+```
+Uploads to `gpu_traces/tree/traces/cg_mem_inspect/<timestamp>/<host>/` (override the
+bucket with `--bucket`). Requires the `manifold` CLI + access.
+
+**Perfetto web from a local server (alternative):** `serve.py` (no `--publish`) hosts
+the traces with CORS and prints a `https://ui.perfetto.dev/#!/?url=...` link.
+
+```bash
+uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py   # serves ./cg_mem_artifacts on :8099
+ssh -L 8099:localhost:8099 <devserver>                             # then click the printed link
 ```
 The link defaults to `http://localhost:8099` because Perfetto's HTTPS page can only
 fetch an `http://` trace from **localhost** (a remote host is blocked as mixed
 content) — hence the SSH tunnel. If your browser can reach the devserver directly,
-use `serve.py --host <fqdn>` instead. `serve.py --link-only` just prints the links
-(no server), and you can always drag a `*.perfetto.json` onto https://ui.perfetto.dev.
+use `serve.py --host <fqdn>`. `serve.py --link-only` prints the links without serving,
+and you can always drag a `*.perfetto.json` onto https://ui.perfetto.dev.
 
 Each row (track) is a capture/segment window in time order; each slice is a tensor
 placed at its pool offset with width = its size. Zoom/search/filter over all
