@@ -1354,6 +1354,16 @@ def _mib(n: int) -> str:
     return f"{n / (1024 * 1024):.2f} MiB"
 
 
+def _hbytes(n: int) -> str:
+    """Human-readable bytes (B / KiB / MiB / GiB) for slice labels."""
+    f = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if f < 1024 or unit == "GiB":
+            return f"{int(f)} {unit}" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{f:.1f} GiB"
+
+
 def _bar_detector(bar: dict) -> Optional[str]:
     """Strongest matching detector for a bar, or None when it has no finding."""
     dets = bar.get("finding_detectors") or []
@@ -1665,7 +1675,10 @@ def to_perfetto(result: dict) -> dict:
                     "pid": pid,
                     "tid": 0,
                     "cat": "alloc",
-                    "name": b["label"],
+                    # Perfetto renders every slice like a duration/function event and
+                    # formats ts/dur as time; bake the bytes into the name so the
+                    # rectangle reads as memory (width = size, position = offset).
+                    "name": f"{_hbytes(b['size'])} @ +{_hbytes(offset)}  {b['label']}",
                     "ts": offset,
                     "dur": max(b["size"], 1),
                     "cname": _slice_cname(b),

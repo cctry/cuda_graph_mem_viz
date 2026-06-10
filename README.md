@@ -129,6 +129,11 @@ conventions:
 Flagged slices carry their `finding_ids`/`detectors`/`impact`/spanned-windows in the
 hover args and are colored by their strongest detector; unflagged slices are grey.
 
+> Perfetto draws every slice like a duration/function event and reads Chrome-trace
+> `ts`/`dur` as microseconds, so the detail panel's **"Start time" is really the byte
+> offset and "Duration" is the byte size** (Perfetto just formats them as time). Each
+> slice name leads with the real bytes, e.g. `80.0 KiB @ +4.0 MiB  forward (...)`.
+
 **Static HTML fallback:** open `*.gantt.html` (an offline per-tensor lifetime view).
 
 ## 4. Multi-rank: select, compare, regression baseline
