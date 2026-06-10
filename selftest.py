@@ -1747,6 +1747,93 @@ def run() -> int:
             "AC-9: a flagged allocation must be color-highlighted by its detector (not grey)"
         )
 
+    # Round-13 AC-9: complete slices must not overlap on one Perfetto track — render
+    # only the peak-live (address-disjoint) set, so address reuse within a window
+    # (A freed, B reallocated at the same offset) does not emit two slices at the
+    # same offset (which Perfetto drops as overlapping).
+    ru = []
+
+    def _rua(addr, size, name):
+        ru.append(
+            {
+                "action": "alloc",
+                "addr": addr,
+                "size": size,
+                "time_us": len(ru) * 10,
+                "frames": _frame(name),
+            }
+        )
+
+    def _ruf(addr):
+        ru.append(
+            {
+                "action": "free_requested",
+                "addr": addr,
+                "size": 0,
+                "time_us": len(ru) * 10,
+                "frames": [],
+            }
+        )
+
+    _rua(GP, 8 * MiB, "A")  # ord0
+    _ruf(GP)  # ord1
+    _rua(GP, 8 * MiB, "B")  # ord2 reuse the same offset
+    _ruf(GP)  # ord3
+    _rua(GP + 16 * MiB, 1 * MiB, "C")  # ord4 distinct offset, live with nothing else
+    ru_raw = {
+        "segments": [
+            {
+                "address": GP,
+                "total_size": 64 * MiB,
+                "stream": 1,
+                "segment_pool_id": (0, 1),
+                "segment_type": "large",
+                "blocks": [
+                    {
+                        "address": GP,
+                        "size": 8 * MiB,
+                        "requested_size": 8 * MiB,
+                        "state": "inactive",
+                        "frames": [],
+                    }
+                ],
+            }
+        ],
+        "device_traces": [ru],
+        "allocator_settings": {},
+        "external_annotations": [],
+    }
+    rures = analyze(
+        normalize(ru_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "bridges": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "capture_windows": [_std_win(1, 0, 5, "w")],
+        },
+    )
+
+    def _overlaps(events):
+        per_pid = {}
+        for e in events:
+            if e.get("ph") == "X":
+                per_pid.setdefault(e["pid"], []).append((e["ts"], e["ts"] + e["dur"]))
+        for ivs in per_pid.values():
+            ivs.sort()
+            for (s1, e1), (s2, e2) in zip(ivs, ivs[1:]):
+                if s2 < e1:  # partial overlap (touching s2 == e1 is allowed)
+                    return True
+        return False
+
+    for _name, _res in (("reuse", rures), ("windowed", mmres), ("bands", result)):
+        if _overlaps(to_perfetto(_res)["traceEvents"]):
+            failures.append(
+                f"AC-9: Perfetto must not emit overlapping complete slices on one "
+                f"track ({_name})"
+            )
+
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
     try:

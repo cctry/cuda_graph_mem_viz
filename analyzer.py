@@ -1532,6 +1532,24 @@ def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
     return tracks
 
 
+def _peak_ordinal(in_win: List[dict], b0: int, e0: int) -> int:
+    """Capture-order ordinal of max simultaneously-live bytes within ``[b0, e0)``
+    (each bar's lifetime clipped to the window). Used to pick the instant whose
+    live set is rendered for a track."""
+    deltas: List[Tuple[int, int]] = []
+    for b in in_win:
+        deltas.append((max(b["alloc_ord"], b0), b["size"]))
+        deltas.append((min(b["free_ord"], e0), -b["size"]))
+    deltas.sort(key=lambda d: (d[0], -d[1]))
+    live = peak = 0
+    at = b0
+    for ord_, d in deltas:
+        live += d
+        if live > peak:
+            peak, at = live, ord_
+    return at
+
+
 def to_perfetto(result: dict) -> dict:
     """Chrome Trace Event JSON for Perfetto (https://ui.perfetto.dev) rendered as a
     **memory map over capture time**.
@@ -1545,9 +1563,14 @@ def to_perfetto(result: dict) -> dict:
         windows exist); reading vertically down a memory column shows how that
         region is reused by different tensors across time.
 
-    A tensor live across N windows appears on N consecutive tracks at the same
-    x-offset. Slices are coloured by inefficiency signature. Lifetime stays
-    capture-order (AC-8), never wall-clock. Loads in any Perfetto instance.
+    Each track shows the pool layout at the window's **peak-occupancy instant** — the
+    set of allocations live at that ordinal, which are disjoint in address (the
+    caching allocator never has two live blocks overlap), so no slice is dropped by
+    Perfetto's complete-event overlap rule. (Address reuse within a window is two
+    distinct, non-simultaneous allocations; the full per-allocation lifetimes live in
+    ``*.analysis.json``.) A tensor live across N windows appears on N tracks at the
+    same x-offset. Slices are coloured by inefficiency signature; lifetime stays
+    capture-order (AC-8), never wall-clock.
     """
     bars = result.get("bars") or []
     # Pool base = smallest graph-pool segment address (fallback: smallest bar addr).
@@ -1576,9 +1599,15 @@ def to_perfetto(result: dict) -> dict:
                 "args": {"sort_index": i},
             }
         )
-        for b in bars:
-            if not (b["alloc_ord"] < e0 and b0 < b["free_ord"]):
-                continue
+        # Render the layout at the window's peak-occupancy instant: the live set is
+        # disjoint in address, so no complete slice overlaps another on this track.
+        in_win = [b for b in bars if b["alloc_ord"] < e0 and b0 < b["free_ord"]]
+        t = _peak_ordinal(in_win, b0, e0)
+        live = sorted(
+            (b for b in in_win if b["alloc_ord"] <= t < b["free_ord"]),
+            key=lambda b: b["addr"],
+        )
+        for b in live:
             offset = b["addr"] - pool_base
             args = {
                 "size_MiB": round(b["size"] / (1024 * 1024), 3),
