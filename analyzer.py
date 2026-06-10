@@ -20,6 +20,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import bisect
 import html
 import json
 import os
@@ -1573,15 +1574,39 @@ def to_perfetto(result: dict) -> dict:
     capture-order (AC-8), never wall-clock.
     """
     bars = result.get("bars") or []
-    # Pool base = smallest graph-pool segment address (fallback: smallest bar addr).
-    seg_bases = [
-        s["address"]
+    # The reserved segments often sit at wildly-spread CUDA virtual addresses (e.g.
+    # four 2 MiB segments scattered across ~6 GB), so raw `addr - min_addr` would put
+    # tiny slices in a mostly-empty 6 GB axis. Instead PACK the rendered pool's
+    # segments contiguously on the x-axis (dropping the meaningless inter-segment
+    # virtual gaps) while keeping each allocation's offset WITHIN its segment, so real
+    # holes/fragmentation stay visible. The packing is global (same for all tracks),
+    # so columns still line up vertically.
+    shown_pools = {str(b["pool_id"]) for b in bars}
+    segs = [
+        s
         for s in result.get("segments", [])
-        if s.get("is_graph_pool") and s.get("address") is not None
-    ]
-    if not seg_bases and bars:
-        seg_bases = [min(b["addr"] for b in bars)]
-    pool_base = min(seg_bases) if seg_bases else 0
+        if s.get("address") is not None and str(s.get("pool_id")) in shown_pools
+    ] or [s for s in result.get("segments", []) if s.get("address") is not None]
+    seg_starts: List[int] = []
+    seg_ends: List[int] = []
+    seg_packed: List[int] = []
+    cursor = 0
+    for s in sorted(segs, key=lambda s: s["address"]):
+        seg_starts.append(s["address"])
+        seg_ends.append(s["address"] + s["total_size"])
+        seg_packed.append(cursor)
+        cursor += s["total_size"]
+    packed_pool_bytes = cursor
+    pool_base = (
+        seg_starts[0] if seg_starts else min((b["addr"] for b in bars), default=0)
+    )
+
+    def _x(addr: int) -> int:
+        """Packed x-offset: segment's packed base + offset within the segment."""
+        i = bisect.bisect_right(seg_starts, addr) - 1
+        if 0 <= i < len(seg_starts) and addr < seg_ends[i]:
+            return seg_packed[i] + (addr - seg_starts[i])
+        return addr - pool_base  # defensive (a bar outside every rendered segment)
 
     tracks = _memory_map_tracks(result)
     events: List[dict] = []
@@ -1608,7 +1633,7 @@ def to_perfetto(result: dict) -> dict:
             key=lambda b: b["addr"],
         )
         for b in live:
-            offset = b["addr"] - pool_base
+            offset = _x(b["addr"])
             args = {
                 "size_MiB": round(b["size"] / (1024 * 1024), 3),
                 "size_bytes": b["size"],
@@ -1653,10 +1678,13 @@ def to_perfetto(result: dict) -> dict:
         "traceEvents": events,
         "metadata": {
             "tool": "cg_mem_inspect",
-            "view": "memory map: x=pool offset (bytes), y=capture time (tracks top->bottom)",
-            "x_axis": "memory offset within graph pool (bytes); slice width = allocation size",
+            "view": "memory map: x=packed pool offset (bytes), y=capture time (tracks top->bottom)",
+            "x_axis": "packed graph-pool offset (bytes): reserved segments concatenated "
+            "(inter-segment virtual gaps removed); slice width = allocation size",
             "y_axis": "capture-order time as per-window tracks (earliest at top); not wall-clock",
             "pool_base": hex(pool_base),
+            "packed_pool_bytes": packed_pool_bytes,
+            "num_segments": len(seg_starts),
             "num_tracks": len(tracks),
             "peak_live_MiB": round(result["peak_live_bytes"] / (1024 * 1024), 2),
             "cross_graph_signature": result["cross_graph_signature"],

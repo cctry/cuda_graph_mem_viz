@@ -117,7 +117,9 @@ use `serve.py --host <fqdn>`. `serve.py --link-only` prints the links without se
 and you can always drag a `*.perfetto.json` onto https://ui.perfetto.dev.
 
 Each row (track) is a capture/segment window in time order; each slice is a tensor
-placed at its pool offset with width = its size. Zoom/search/filter over all
+placed at its packed pool offset (the reserved segments are concatenated so the
+scattered CUDA virtual-address gaps don't squeeze the view) with width = its size.
+Zoom/search/filter over all
 allocations (e.g. search `fused_norm_residual` for persistent bridges). Reading
 conventions:
 - **down a memory column** (same x across stacked tracks) → how that region is
@@ -165,7 +167,8 @@ Labels come from the allocating call-site frame (e.g. `forward_cuda_c (fused_nor
 ## Notes
 - **Lifetime = capture/segment order**, not replay wall-clock (CUDA graph replay
   does no allocations). The Perfetto y-axis (tracks) is capture-order time; the
-  x-axis is pool memory offset (not wall-clock).
+  x-axis is the packed pool offset — reserved segments concatenated, with the
+  meaningless inter-segment virtual-address gaps removed (not wall-clock).
 - Pool attribution uses the allocator's `segment_pool_id` (graph pool vs default).
 - Feature availability is gated by `capability_manifest` ∩ the analyzed snapshot;
   missing fields fail closed (no fabricated layout/lifetime) or degrade with a note.
