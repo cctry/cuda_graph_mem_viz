@@ -17,7 +17,6 @@ try:
         _run_artifact_dir,
         _run_compare_ranks,
         analyze,
-        to_html,
         to_memmap_html,
     )
     from .schema import SchemaError, normalize
@@ -28,7 +27,6 @@ except ImportError:  # run directly by path
         _run_artifact_dir,
         _run_compare_ranks,
         analyze,
-        to_html,
         to_memmap_html,
     )
     from schema import SchemaError, normalize
@@ -289,8 +287,10 @@ def run() -> int:
         for k in ("S1_lingering", "S2_pool_bloating", "S3_non_reusable")
     ):
         failures.append("AC-1.1: no signatures should be flagged without history")
-    if "Gantt unavailable" not in to_html(dres):
-        failures.append("AC-1.1: degraded HTML must state the Gantt is unavailable")
+    if "Memory map unavailable" not in to_memmap_html(dres):
+        failures.append(
+            "AC-1.1: degraded HTML must state the memory map is unavailable"
+        )
 
     # AC-1.1: a manifest marking history absent overrides a snapshot that has events.
     manifest_nohist = {
@@ -1840,7 +1840,6 @@ def run() -> int:
             out_dir=_d,
             include_default_pool=False,
             title="t",
-            max_rows=50,
             bridges=None,
             sidecar=None,
             manifest=None,

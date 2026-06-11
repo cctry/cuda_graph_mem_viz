@@ -1,4 +1,4 @@
-"""Offline analyzer + Gantt visualizer for CUDA-graph pool memory (AC-2/8/9).
+"""Offline analyzer + memory-map visualizer for CUDA-graph pool memory (AC-2/8/9).
 
 Consumes a normalized PyTorch memory snapshot and produces:
   * per-pool / per-segment layout with fragmentation (holes) and padding waste,
@@ -6,7 +6,7 @@ Consumes a normalized PyTorch memory snapshot and produces:
     allocations, so lifetime is capture/event order, never replay wall-clock),
   * the three inefficiency signatures (lingering / pool-bloating / cross-graph
     non-reusable), and
-  * a self-contained HTML Gantt-style tensor-lifetime diagram plus per-bar JSON.
+  * a self-contained interactive time x address HTML memory map plus per-bar JSON.
 
 Tensor labels come from the allocating call-site frames (no sidecar required).
 Capture-window boundaries (from the runtime shim) sharpen the cross-graph
@@ -1234,7 +1234,7 @@ def analyze(
         gantt_available = True
     else:
         # AC-1.1 / AC-9 negative: no allocation event stream -> degrade. Do not
-        # fabricate lifetimes or a Gantt; report layout + a coexistence proxy.
+        # fabricate lifetimes or a memory map; report layout + a coexistence proxy.
         allocs, end = [], 0
         signatures = {
             "S1_lingering": False,
@@ -1374,7 +1374,7 @@ def analyze(
 
 
 # --------------------------------------------------------------------------- #
-# HTML Gantt rendering (self-contained, no external assets).
+# HTML rendering helpers (degraded layout-only page; self-contained, no assets).
 # --------------------------------------------------------------------------- #
 
 # HTML bar colours + labels are keyed by AC-10 detector (findings are the source of
@@ -1421,7 +1421,7 @@ def _bar_color(bar: dict) -> str:
 
 
 def _seg_rows_html(segments: List[dict]) -> str:
-    """Per-segment layout table rows (shared by the Gantt + degraded HTML)."""
+    """Per-segment layout table rows for the degraded (layout-only) HTML."""
     return "".join(
         f"<tr><td>{html.escape(str(s['pool_id']))}</td>"
         f"<td>{'graph' if s['is_graph_pool'] else 'default'}</td>"
@@ -1433,7 +1433,7 @@ def _seg_rows_html(segments: List[dict]) -> str:
 
 
 def _degraded_html(result: dict, title: str) -> str:
-    """Layout-only page shown when the Gantt is unavailable (no allocation history)."""
+    """Layout-only page shown when the memory map is unavailable (no allocation history)."""
     skipped = "; ".join(result.get("features_skipped", [])) or "n/a"
     seg_rows = _seg_rows_html(result["segments"])
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
@@ -1442,95 +1442,14 @@ table{{border-collapse:collapse;margin:8px 0}} td,th{{border:1px solid #ddd;padd
 th{{background:#f4f4f4}} td:first-child,th:first-child{{text-align:left}}
 .warn{{background:#fff3cd;border:1px solid #ffe69c;padding:10px;border-radius:4px}}</style></head><body>
 <h1>{html.escape(title)}</h1>
-<p class="warn"><b>Gantt unavailable</b> — this snapshot has no allocation history
+<p class="warn"><b>Memory map unavailable</b> — this snapshot has no allocation history
 (<code>device_traces</code>), so per-tensor capture-order lifetimes cannot be
 reconstructed (CUDA graph replay performs no allocations). Showing segment layout
 and a coexistence proxy only. Skipped features: {html.escape(skipped)}.</p>
 <p>Coexistence (active graph-pool bytes): <b>{_mib(result['peak_live_bytes'])}</b>.
-Re-capture with <code>_record_memory_history</code> enabled to get the Gantt.</p>
+Re-capture with <code>_record_memory_history</code> enabled to get the memory map.</p>
 <table><tr><th>pool_id</th><th>kind</th><th>total</th><th>active</th><th>inactive</th>
 <th>largest hole</th><th>frag</th><th>padding</th></tr>{seg_rows}</table>
-</body></html>"""
-
-
-def to_html(
-    result: dict, title: str = "CUDA Graph Pool Tensor Lifetimes", max_rows: int = 500
-) -> str:
-    if not result.get("gantt_available", True):
-        return _degraded_html(result, title)
-    end = max(result["event_count"], 1)
-    row_h = 20
-    # Render flagged + largest allocations first; cap rows so the page stays
-    # usable on real captures (tens of thousands of allocations). Never silent:
-    # the omitted count is shown and the full per-bar data lives in the JSON.
-    all_bars = result["bars"]
-    # Findings drive ordering (flagged first) and colour, not the legacy flags.
-    selected = sorted(
-        all_bars, key=lambda b: (0 if b.get("finding_ids") else 1, -b["size"])
-    )[:max_rows]
-    omitted = len(all_bars) - len(selected)
-    selected = sorted(selected, key=lambda b: b["alloc_ord"])
-
-    rows = []
-    for i, b in enumerate(selected):
-        left = 100.0 * b["alloc_ord"] / end
-        width = max(0.4, 100.0 * (b["free_ord"] - b["alloc_ord"]) / end)
-        color = _bar_color(b)
-        dets = b.get("finding_detectors") or []
-        findtxt = ", ".join(_DETECTOR_HTML_LABEL.get(d, d) for d in dets) or "ok"
-        find_extra = (
-            f" (impact {b.get('finding_impact', 0)})" if b.get("finding_ids") else ""
-        )
-        tip = html.escape(
-            f"{b['label']} | {_mib(b['size'])} | ord {b['alloc_ord']}->"
-            f"{'END' if b['never_freed'] else b['free_ord']} | pool {b['pool_id']} | "
-            f"{findtxt}{find_extra}"
-        )
-        lbl = html.escape(f"{_mib(b['size'])}  {b['label']}")
-        rows.append(
-            f'<div class="row" style="top:{i * row_h}px">'
-            f'<div class="bar" style="left:{left:.3f}%;width:{width:.3f}%;background:{color}" '
-            f'title="{tip}"></div>'
-            f'<span class="lbl" style="left:calc({left:.3f}% + 4px)">{lbl}</span>'
-            f"</div>"
-        )
-    track_h = max(len(selected) * row_h, row_h)
-
-    seg_rows = _seg_rows_html(result["segments"])
-    legend = "".join(
-        f'<span class="leg"><span class="sw" style="background:{_DETECTOR_HEX[k]}"></span>'
-        f"{html.escape(_DETECTOR_HTML_LABEL[k])}</span>"
-        for k in _DETECTOR_PRECEDENCE
-    )
-    fc = result.get("finding_counts", {})
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
-<style>
-body{{font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;margin:20px;color:#222}}
-h1{{font-size:18px}} .meta{{color:#555;margin-bottom:8px}}
-table{{border-collapse:collapse;margin:8px 0}} td,th{{border:1px solid #ddd;padding:3px 8px;text-align:right}}
-th{{background:#f4f4f4}} td:first-child,th:first-child{{text-align:left}}
-.track{{position:relative;border:1px solid #ccc;background:#fafafa;height:{track_h}px;margin-top:6px}}
-.row{{position:absolute;left:0;right:0;height:{row_h}px}}
-.bar{{position:absolute;top:3px;height:14px;border-radius:2px;opacity:.85}}
-.lbl{{position:absolute;top:2px;font-size:11px;color:#111;white-space:nowrap;pointer-events:none}}
-.leg{{margin-right:14px}} .sw{{display:inline-block;width:12px;height:12px;margin-right:4px;vertical-align:middle;border-radius:2px}}
-.axis{{color:#888;font-size:11px;display:flex;justify-content:space-between;margin-top:2px}}
-</style></head><body>
-<h1>{html.escape(title)}</h1>
-<div class="meta">Lifetime axis: <b>capture-order event ordinal</b> (0..{end}); graph replay performs no allocations.
-Cross-graph signature: <b>{html.escape(result['cross_graph_signature'])}</b>.
-Peak live: <b>{_mib(result['peak_live_bytes'])}</b> @ ord {result['peak_live_at_ordinal']}.
-Graph-pool allocations: {result['num_allocations_shown']} (of {result['num_allocations_total']} total).
-Rendering {len(selected)} bars (flagged + largest first); <b>{omitted}</b> omitted &mdash; full data in the JSON.</div>
-<div class="meta">Findings &mdash; oversized: <b>{fc.get('oversized_capture_allocation', 0)}</b>,
-non-reusable: <b>{fc.get('non_reusable_across_graphs', 0)}</b>,
-long-lived: <b>{fc.get('long_lived_outlier', 0)}</b>
-&mdash; cross-graph: {html.escape(result['cross_graph_signature'])}.</div>
-<div>{legend}</div>
-<table><tr><th>pool_id</th><th>kind</th><th>total</th><th>active</th><th>inactive</th>
-<th>largest hole</th><th>frag</th><th>padding</th></tr>{seg_rows}</table>
-<div class="track">{''.join(rows)}</div>
-<div class="axis"><span>capture start (ord 0)</span><span>capture end (ord {end})</span></div>
 </body></html>"""
 
 
@@ -2300,12 +2219,9 @@ def _run_one(
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(snapshot_path))[0]
     json_path = os.path.join(out_dir, f"{base}.analysis.json")
-    html_path = os.path.join(out_dir, f"{base}.gantt.html")
     memmap_path = os.path.join(out_dir, f"{base}.memmap.html")
     with open(json_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
-    with open(html_path, "w") as f:
-        f.write(to_html(result, title=args.title, max_rows=args.max_rows))
     with open(memmap_path, "w") as f:
         f.write(to_memmap_html(result, title=args.title))
 
@@ -2348,7 +2264,7 @@ def _run_one(
         print(f"cross-graph: {result['cross_graph_signature']}")
     else:
         print("Gantt/lifetime DISABLED (degraded layout-only report).")
-    print(f"JSON: {json_path}  MemMap: {memmap_path}  Gantt: {html_path}")
+    print(f"JSON: {json_path}  MemMap: {memmap_path}")
     return 0
 
 
@@ -2699,16 +2615,10 @@ def main() -> int:
     )
     parser.add_argument("--title", default="CUDA Graph Pool Tensor Lifetimes")
     parser.add_argument(
-        "--max-rows",
-        type=int,
-        default=500,
-        help="max Gantt bars to render (flagged + largest first)",
-    )
-    parser.add_argument(
         "--manifest",
         default=None,
         help="capability manifest from validator.py (default: sibling capability_manifest.json). "
-        "Gates layout/lifetime/Gantt; absent fields fail closed or degrade.",
+        "Gates layout/lifetime/memmap; absent fields fail closed or degrade.",
     )
     parser.add_argument(
         "--sidecar",

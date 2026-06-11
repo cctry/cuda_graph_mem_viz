@@ -82,14 +82,13 @@ uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
 ```
 
 Auto-loads the sibling `.sidecar.json` (and `capability_manifest.json`) and emits
-three outputs next to the pickle:
+two outputs next to the pickle:
 - `*.memmap.html` — **the headline view**: a self-contained interactive
   *time × address* memory map (described next). No server, no upload — open it directly.
 - `*.analysis.json` — per-allocation + per-segment data: segment layout +
   fragmentation, capture-order lifetimes, `graph_slot_labels` with provenance,
   `sidecar_meta`, per-window `reports` (with `pool_layout` holes/fragmentation at the
   window peak), and a top-level **`findings[]`** (see below).
-- `*.gantt.html` — minimal static lifetime fallback (capped to flagged + largest bars).
 
 Useful flags: `--include-default-pool`, `--sidecar <path>`, `--manifest <path>`,
 `--out-dir <dir>`, plus the detector thresholds below.
@@ -139,8 +138,6 @@ cluster is IPv6-only, which `python -m http.server` can't bind):
 uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py   # serves ./cg_mem_artifacts on :8099
 ssh -L 8099:localhost:8099 <devserver>                             # then open the printed link
 ```
-
-**Static fallback:** open `*.gantt.html` (a minimal per-tensor lifetime bar chart).
 
 ### Findings (the ranked inefficiency list)
 `findings[]` (in `*.analysis.json`) is sorted by `impact = size_bytes × max(1,
