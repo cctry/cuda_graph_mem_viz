@@ -105,6 +105,10 @@ class NormalizedSnapshot:
     events: List[TraceEvent]
     field_availability: Dict[str, bool] = field(default_factory=dict)
     schema_fingerprint: Dict[str, List[str]] = field(default_factory=dict)
+    # Per-device raw trace lengths (before flattening). A device whose length
+    # equals the configured history max_entries has a SATURATED ring buffer:
+    # torch evicted its oldest events, so early captures are missing/shifted.
+    device_trace_lens: List[int] = field(default_factory=list)
 
 
 def _require(d: Dict[str, Any], keys: Tuple[str, ...], where: str) -> None:
@@ -244,6 +248,7 @@ def normalize(raw: Dict[str, Any]) -> NormalizedSnapshot:
             "block_keys": sorted(blk_key_union),
             "trace_keys": sorted(trace_key_union),
         },
+        device_trace_lens=[len(t) for t in raw_traces if isinstance(t, list)],
     )
 
 

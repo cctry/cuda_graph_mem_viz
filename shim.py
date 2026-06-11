@@ -17,9 +17,11 @@ For each runner it dumps, beside the rank-safe snapshot pickle, a
   * bridges          — weak-ref bridge tensors with an allocator-event ordinal so
     the analyzer can match them to the allocation live at that moment.
 
-Event ordinals are read by flattening ``torch.cuda.memory._snapshot()["device_traces"]``
-at each boundary; this is O(n) per call (no cheaper counter exists) so capture a
-small shape set when profiling large models. Activation is gated by the env var
+Event ordinals are derived O(1) per boundary from the allocator's cumulative
+``memory_stats`` counters, calibrated once against a real ``_snapshot()`` while
+the trace is still tiny (a full snapshot serializes every recorded event with
+frames — ~1s per call at 1M events, which once made a per-boundary-snapshot
+breakable capture take ~12 hours). Activation is gated by the env var
 CG_MEM_INSPECT (set by launch.py); unset -> pass-throughs, so importing is safe.
 """
 
@@ -83,10 +85,12 @@ def _outdir() -> str:
 
 
 def _max_entries() -> int:
+    # Per-device ring size. A full tier1 capture (74 token buckets) records
+    # ~1.3M events; the old 1M default silently evicted the first buckets.
     try:
-        return int(os.environ.get(MAX_ENTRIES_ENV, "1000000"))
+        return int(os.environ.get(MAX_ENTRIES_ENV, "4000000"))
     except ValueError:
-        return 1_000_000
+        return 4_000_000
 
 
 def _rank_world_pid():
@@ -125,17 +129,65 @@ def _window_key(runner, axis, value, stream_idx=None, segment_idx=None) -> str:
     return key
 
 
+# O(1) trace-length state: torch exposes no event counter, and a real
+# ``_snapshot()`` serializes the whole trace (frames included) — ~1s per call at
+# 1M events, which once turned a breakable capture into a 12-hour run (one call
+# per segment boundary). The allocator's cumulative ``memory_stats`` counters
+# reproduce the trace length exactly on this build:
+#   len(trace) = allocation.allocated + 2*allocation.freed   (free_requested +
+#                free_completed) + num_device_alloc + num_device_free
+#                + markers ('snapshot' events; one per device per _snapshot call)
+# A one-time calibration against a real snapshot (taken at first use, while the
+# trace is tiny and the call is cheap) absorbs any constant offset.
+_o1 = {"base": None, "snap_calls": 0}
+
+
+def _snapshot_len() -> int:
+    """Real (O(n)) event count; also appends one 'snapshot' marker per device."""
+    import torch
+
+    traces = torch.cuda.memory._snapshot().get("device_traces") or []
+    _o1["snap_calls"] += 1
+    return sum(len(t) for t in traces if isinstance(t, list))
+
+
+def _stats_len() -> int:
+    """O(1) trace-length estimate from cumulative allocator stats + markers."""
+    import torch
+
+    ndev = torch.cuda.device_count()
+    total = 0
+    for d in range(ndev):
+        st = torch.cuda.memory_stats(d)
+        total += (
+            st.get("allocation.all.allocated", 0)
+            + st.get("allocation.all.freed", 0) * 2
+            + st.get("num_device_alloc", 0)
+            + st.get("num_device_free", 0)
+        )
+    # Markers from OUR _snapshot calls (calibration / final dump); a snapshot's
+    # returned trace excludes its own markers, but the final dump includes them.
+    return total + _o1["snap_calls"] * ndev
+
+
 def _trace_len() -> int:
     """Current number of recorded allocator events = next event's ordinal.
 
     Aligns with the analyzer's ordinal space (events appended chronologically).
-    O(n) per call — no cheaper counter is exposed by torch.
-    """
+    O(1) via allocator stats after a one-time real-snapshot calibration."""
     try:
-        import torch
+        if _o1["base"] is None:
+            import torch
 
-        traces = torch.cuda.memory._snapshot().get("device_traces") or []
-        return sum(len(t) for t in traces if isinstance(t, list))
+            f0 = _stats_len()
+            real = _snapshot_len()  # cheap here: first use, trace still small
+            # The formula now counts the markers that call just added; subtract
+            # them to compare against ``real`` (which excludes its own markers).
+            f1 = _stats_len() - torch.cuda.device_count()
+            # f0 == f1 -> quiescent reads; either way the base is exact unless
+            # an allocator event raced between the two reads (error <= that).
+            _o1["base"] = real - (f0 if f0 == f1 else f1)
+        return _stats_len() + _o1["base"]
     except Exception:
         return -1
 
@@ -164,6 +216,12 @@ def _start_recording() -> None:
         )
     except TypeError:
         mem._record_memory_history(max_entries=_max_entries())
+    # (Re)enabling recording CLEARS the trace ring while the cumulative allocator
+    # stats keep counting, so any prior O(1) calibration is stale by exactly the
+    # discarded trace length (a per-runner restart once shifted every breakable
+    # window ordinal by ~714k). Recalibrate lazily against the fresh, tiny trace.
+    _o1["base"] = None
+    _o1["snap_calls"] = 0
 
 
 def _stop_recording() -> None:
@@ -309,6 +367,8 @@ def _dump(runner: str) -> None:
         "pid": pid,
         "artifact_stem": stem,
         "max_entries": _max_entries(),
+        "trace_len_mode": "stats_o1",  # O(1) stats counter (calibrated)
+        "trace_len_base": _o1["base"],
         "pool_handle": _pool_handle(),
         "capture_windows": list(_capture_windows),
         "segment_windows": list(_segment_windows),
@@ -530,6 +590,32 @@ def _patch_piecewise_runner(module) -> None:
     )
 
 
+def _patch_eagle_runner(module, cls_name: str, runner_name: str) -> None:
+    """EAGLE/speculative draft runners share the target's per-batch-size capture
+    interface (``capture`` + ``capture_one_batch_size(bs, forward, stream_idx)``) and
+    the SAME global graph memory pool, so they are wrapped exactly like ``standard``
+    — just tagged with their own runner name so the dump/sidecar are distinct."""
+    cls = getattr(module, cls_name, None)
+    if cls is None:
+        return
+    _wrap_method(cls, "capture", _wrap_outer_capture, runner_name)
+    _wrap_method(cls, "capture_one_batch_size", _wrap_per_shape, runner_name, "bs")
+
+
+def _patch_eagle_draft_runner(module) -> None:
+    _patch_eagle_runner(module, "EAGLEDraftCudaGraphRunner", "eagle_draft")
+
+
+def _patch_eagle_draft_extend_runner(module) -> None:
+    _patch_eagle_runner(module, "EAGLEDraftExtendCudaGraphRunner", "eagle_draft_extend")
+
+
+def _patch_multilayer_eagle_draft_extend_runner(module) -> None:
+    _patch_eagle_runner(
+        module, "MultiLayerEagleDraftExtendCudaGraphRunner", "eagle_ml_draft_extend"
+    )
+
+
 def _patch_breakable_module(module) -> None:
     cur = getattr(module, "_weak_ref_if_tensor", None)
     if cur is not None and not getattr(cur, "_cgmem", False):
@@ -591,6 +677,10 @@ def install() -> None:
                 "sglang.srt.model_executor.breakable_cuda_graph_runner": _patch_breakable_runner,
                 "sglang.srt.model_executor.piecewise_cuda_graph_runner": _patch_piecewise_runner,
                 "sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph": _patch_breakable_module,
+                # EAGLE / speculative-decoding draft graphs (share the global graph pool).
+                "sglang.srt.speculative.eagle_draft_cuda_graph_runner": _patch_eagle_draft_runner,
+                "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner": _patch_eagle_draft_extend_runner,
+                "sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner": _patch_multilayer_eagle_draft_extend_runner,
             }
         )
         for name, fn in _TARGETS.items():

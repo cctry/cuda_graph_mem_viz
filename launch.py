@@ -13,6 +13,10 @@ Usage (all args after this script are passed straight through to launch_server):
 Snapshots + sidecars (capture/segment windows, GraphSlot map, bridges) and an
 artifact_manifest.json are written to CG_MEM_INSPECT_OUTDIR
 (default: ./cg_mem_artifacts under the directory you launch from).
+
+``--load-format dummy`` is injected by default (the memory shim only needs the
+CUDA-graph capture, not the real checkpoint, so dummy weights start far faster);
+pass your own ``--load-format`` to override.
 """
 
 import os
@@ -35,7 +39,14 @@ def main() -> None:
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in [_SITEDIR, _REPO, env.get("PYTHONPATH", "")] if p
     )
-    cmd = [sys.executable, "-m", "sglang_meta.launch_server"] + sys.argv[1:]
+    # Default to dummy weights: the shim only needs CUDA-graph capture, not the real
+    # checkpoint, so a dummy load starts much faster. User --load-format wins.
+    passthrough = list(sys.argv[1:])
+    if not any(
+        a == "--load-format" or a.startswith("--load-format=") for a in passthrough
+    ):
+        passthrough += ["--load-format", "dummy"]
+    cmd = [sys.executable, "-m", "sglang_meta.launch_server"] + passthrough
     print(
         f"[cg_mem_inspect] launching with shim; outdir={env['CG_MEM_INSPECT_OUTDIR']}",
         file=sys.stderr,

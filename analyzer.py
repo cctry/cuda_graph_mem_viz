@@ -24,6 +24,7 @@ import bisect
 import html
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -34,6 +35,17 @@ except ImportError:  # run directly by path (script dir is on sys.path)
     from schema import Frame, NormalizedSnapshot, SchemaError, Segment, load
 
 DEFAULT_POOL_IDS = (None, (0, 0))
+
+# EAGLE / speculative-decoding draft graphs use their own runner classes, but they
+# share the global graph memory pool and the same per-batch-size capture interface as
+# the target's standard runner, so they are grouped/labeled like "standard" (bs axis).
+_STANDARD_LIKE_RUNNERS = (
+    "standard",
+    "eagle_draft",
+    "eagle_draft_extend",
+    "eagle_ml_draft_extend",
+)
+_ALL_RUNNERS = _STANDARD_LIKE_RUNNERS + ("piecewise", "breakable")
 
 
 @dataclass
@@ -657,7 +669,7 @@ def _build_reports(
             return None
         return b, e
 
-    reports: Dict[str, object] = {"standard": [], "breakable": [], "piecewise": []}
+    reports: Dict[str, object] = {r: [] for r in _ALL_RUNNERS}
     for w in capture_windows_raw:
         runner = w.get("runner")
         # Validate ordinals first so malformed metadata is recorded even for
@@ -733,13 +745,8 @@ def _build_reports(
 # AC-10 structured, impact-ranked inefficiency findings.
 # --------------------------------------------------------------------------- #
 
-# detector -> Perfetto reserved color; precedence picks the slice color when an
-# allocation matches more than one detector (most severe first).
-_DETECTOR_CNAME = {
-    "oversized_capture_allocation": "terrible",
-    "non_reusable_across_graphs": "olive",
-    "long_lived_outlier": "bad",
-}
+# Detector precedence picks the rectangle color when an allocation matches more than
+# one detector (most severe first).
 _DETECTOR_PRECEDENCE = (
     "oversized_capture_allocation",
     "non_reusable_across_graphs",
@@ -1008,6 +1015,40 @@ def analyze(
     avail = _resolve_availability(snap, manifest)
     avail_source = avail["source"]
 
+    # History-ring truncation (fail loud, AC-philosophy: never render silently-wrong
+    # data). torch keeps at most ``max_entries`` trace events PER DEVICE; a device
+    # trace sitting exactly at that cap means the OLDEST events were evicted. The
+    # shim's boundary snapshot markers (recorded on every visible device) survive,
+    # so early capture windows still render — but as EMPTY bands, and the shim's
+    # cumulative boundary ordinals drift from the kept-trace indices, so bucket
+    # attribution after the eviction horizon is unreliable.
+    history_truncation = None
+    me = sc.get("max_entries")
+    dlens = getattr(snap, "device_trace_lens", None) or []
+    if me and any(L >= int(me) for L in dlens):
+        first_real = next(
+            (ev.ordinal for ev in snap.events if ev.action != "snapshot"), 0
+        )
+        all_wins = capture_windows_raw + segment_windows_raw
+        evicted_windows = sum(
+            1
+            for w in all_wins
+            if w.get("end_ord") is not None and int(w["end_ord"]) <= first_real
+        )
+        history_truncation = {
+            "max_entries": int(me),
+            "device_trace_lens": list(dlens),
+            "first_kept_real_event_ord": first_real,
+            "evicted_windows": evicted_windows,
+            "total_windows": len(all_wins),
+            "note": (
+                "allocator history ring overflowed: events before the horizon were "
+                "evicted (windows there render empty) and window->event attribution "
+                "after it may be shifted; re-capture with a larger "
+                "CG_MEM_INSPECT_MAX_ENTRIES or fewer shapes for a trustworthy map"
+            ),
+        }
+
     # AC-2 layout gating (manifest ∩ snapshot):
     #  - intersection available           -> layout on.
     #  - snapshot lacks addresses:
@@ -1045,7 +1086,7 @@ def analyze(
     lifetime_available = history_ok
     bridges_matched = 0
     graph_slot_labels: List[dict] = []
-    reports: dict = {"standard": [], "breakable": [], "piecewise": []}
+    reports: dict = {r: [] for r in _ALL_RUNNERS}
     if lifetime_available:
         allocs, end = _extract_allocations(snap)
         has_ord = _bridges_have_ordinals(eff_bridges) if eff_bridges else False
@@ -1304,6 +1345,7 @@ def analyze(
         "finding_count": len(findings),
         "finding_thresholds": finding_thresholds,
         "lifetime_axis": "capture_order_event_ordinal",
+        "history_truncation": history_truncation,
         "bridges_matched": bridges_matched,
         "cross_graph_signature": cross,
         "graph_slot_labels": graph_slot_labels,
@@ -1493,22 +1535,10 @@ long-lived: <b>{fc.get('long_lived_outlier', 0)}</b>
 
 
 # --------------------------------------------------------------------------- #
-# Perfetto / Chrome trace export (load at ui.perfetto.dev or any Perfetto).
+# Memory-map geometry helpers (shared by the HTML map).
 # --------------------------------------------------------------------------- #
 
-_PERFETTO_NORMAL_COLOR = "grey"
-_PERFETTO_MAX_BANDS = 12  # fallback time bands when no capture windows exist
-
-
-def _slice_cname(bar: dict) -> str:
-    """Color a slice by its strongest matching detector (most severe first) — AC-10
-    findings are the source of truth. A slice with no finding renders normal/grey
-    (the legacy S1/S2/S3 flags never drive the visualization)."""
-    dets = bar.get("finding_detectors") or []
-    for d in _DETECTOR_PRECEDENCE:
-        if d in dets:
-            return _DETECTOR_CNAME[d]
-    return _PERFETTO_NORMAL_COLOR
+_FALLBACK_TIME_BANDS = 12  # uniform time bands when no capture windows exist
 
 
 def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
@@ -1518,13 +1548,13 @@ def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
     otherwise fall back to uniform capture-order bands so the y-axis still reads."""
     tracks: List[Tuple[str, int, int]] = []
     reps = result.get("reports") or {}
-    for runner in ("standard", "piecewise", "breakable"):
+    for runner in _ALL_RUNNERS:
         for w in reps.get(runner) or []:
             b, e = w.get("begin_ord"), w.get("end_ord")
             if b is None or e is None:
                 continue
-            if runner == "standard":
-                lbl = f"standard bs={w.get('batch_size')} stream={w.get('stream_idx')}"
+            if runner in _STANDARD_LIKE_RUNNERS:
+                lbl = f"{runner} bs={w.get('batch_size')} stream={w.get('stream_idx')}"
             elif runner == "piecewise":
                 lbl = f"piecewise num_tokens={w.get('num_tokens')}"
             else:
@@ -1532,7 +1562,7 @@ def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
             tracks.append((lbl, int(b), int(e)))
     if not tracks:
         end = max(int(result.get("event_count", 0)), 1)
-        nb = max(1, min(_PERFETTO_MAX_BANDS, end))
+        nb = max(1, min(_FALLBACK_TIME_BANDS, end))
         step = max(1, -(-end // nb))  # ceil division
         lo = 0
         while lo < end:
@@ -1543,168 +1573,628 @@ def _memory_map_tracks(result: dict) -> List[Tuple[str, int, int]]:
     return tracks
 
 
-def _peak_ordinal(in_win: List[dict], b0: int, e0: int) -> int:
-    """Capture-order ordinal of max simultaneously-live bytes within ``[b0, e0)``
-    (each bar's lifetime clipped to the window). Used to pick the instant whose
-    live set is rendered for a track."""
-    deltas: List[Tuple[int, int]] = []
-    for b in in_win:
-        deltas.append((max(b["alloc_ord"], b0), b["size"]))
-        deltas.append((min(b["free_ord"], e0), -b["size"]))
-    deltas.sort(key=lambda d: (d[0], -d[1]))
-    live = peak = 0
-    at = b0
-    for ord_, d in deltas:
-        live += d
-        if live > peak:
-            peak, at = live, ord_
-    return at
+def _segment_packer(result: dict) -> dict:
+    """Pack the rendered pool's reserved segments contiguously on the x-axis.
 
+    The reserved segments often sit at wildly-spread CUDA virtual addresses (e.g.
+    four 2 MiB segments scattered across ~6 GB), so a raw ``addr - min_addr`` would
+    drop tiny slices into a mostly-empty multi-GB axis. We concatenate the segments
+    (dropping the meaningless inter-segment virtual gaps) while keeping each
+    allocation's offset WITHIN its segment, so real holes/fragmentation stay
+    visible. Packing is global (shared by every track/row), so columns line up.
 
-def to_perfetto(result: dict) -> dict:
-    """Chrome Trace Event JSON for Perfetto (https://ui.perfetto.dev) rendered as a
-    **memory map over capture time**.
-
-    Axis convention (per the user's mental model):
-      * x-axis (Perfetto "time") = memory OFFSET within the graph pool
-        (``addr - pool_base``); a slice's width = the allocation's size, so reading
-        horizontally shows how large a tensor is.
-      * y-axis = capture-order TIME, realized as one track per capture/segment
-        window ordered top→bottom (uniform capture-order bands when no sidecar
-        windows exist); reading vertically down a memory column shows how that
-        region is reused by different tensors across time.
-
-    Each track shows the pool layout at the window's **peak-occupancy instant** — the
-    set of allocations live at that ordinal, which are disjoint in address (the
-    caching allocator never has two live blocks overlap), so no slice is dropped by
-    Perfetto's complete-event overlap rule. (Address reuse within a window is two
-    distinct, non-simultaneous allocations; the full per-allocation lifetimes live in
-    ``*.analysis.json``.) A tensor live across N windows appears on N tracks at the
-    same x-offset. Slices are coloured by inefficiency signature; lifetime stays
-    capture-order (AC-8), never wall-clock.
+    Returns ``x_of(addr) -> packed offset``, the total ``packed_bytes``, the sorted
+    ``segs``, ``pool_base``, and ``run_end_of(addr)`` — the VA end of the
+    contiguous segment run containing ``addr`` (used by the HTML memory map).
     """
     bars = result.get("bars") or []
-    # The reserved segments often sit at wildly-spread CUDA virtual addresses (e.g.
-    # four 2 MiB segments scattered across ~6 GB), so raw `addr - min_addr` would put
-    # tiny slices in a mostly-empty 6 GB axis. Instead PACK the rendered pool's
-    # segments contiguously on the x-axis (dropping the meaningless inter-segment
-    # virtual gaps) while keeping each allocation's offset WITHIN its segment, so real
-    # holes/fragmentation stay visible. The packing is global (same for all tracks),
-    # so columns still line up vertically.
     shown_pools = {str(b["pool_id"]) for b in bars}
     segs = [
         s
         for s in result.get("segments", [])
         if s.get("address") is not None and str(s.get("pool_id")) in shown_pools
     ] or [s for s in result.get("segments", []) if s.get("address") is not None]
-    seg_starts: List[int] = []
-    seg_ends: List[int] = []
+    segs = sorted(segs, key=lambda s: s["address"])
+    seg_starts = [s["address"] for s in segs]
+    seg_ends = [s["address"] + s["total_size"] for s in segs]
     seg_packed: List[int] = []
     cursor = 0
-    for s in sorted(segs, key=lambda s: s["address"]):
-        seg_starts.append(s["address"])
-        seg_ends.append(s["address"] + s["total_size"])
+    for s in segs:
         seg_packed.append(cursor)
         cursor += s["total_size"]
-    packed_pool_bytes = cursor
     pool_base = (
         seg_starts[0] if seg_starts else min((b["addr"] for b in bars), default=0)
     )
 
-    def _x(addr: int) -> int:
+    # VA-contiguous runs: an allocation recorded against a (final-layout) segment can
+    # extend past it into the NEXT segment when the two are VA-contiguous — packing
+    # keeps such runs contiguous, so the rect is still correct. Crossing a real VA
+    # gap, however, would bleed into an unrelated segment's packed range, so the
+    # renderer clips widths at the run end (`run_end_of`).
+    run_ends_by_seg: List[int] = []
+    i = 0
+    while i < len(segs):
+        j = i
+        while j + 1 < len(segs) and seg_starts[j + 1] == seg_ends[j]:
+            j += 1
+        run_ends_by_seg.extend([seg_ends[j]] * (j + 1 - i))
+        i = j + 1
+
+    def x_of(addr: int) -> int:
         """Packed x-offset: segment's packed base + offset within the segment."""
         i = bisect.bisect_right(seg_starts, addr) - 1
         if 0 <= i < len(seg_starts) and addr < seg_ends[i]:
             return seg_packed[i] + (addr - seg_starts[i])
         return addr - pool_base  # defensive (a bar outside every rendered segment)
 
-    tracks = _memory_map_tracks(result)
-    events: List[dict] = []
-    for i, (label, b0, e0) in enumerate(tracks):
-        pid = i + 1
-        events.append(
-            {"ph": "M", "pid": pid, "name": "process_name", "args": {"name": label}}
-        )
-        # Keep tracks in capture-time order (earliest window at the top).
-        events.append(
-            {
-                "ph": "M",
-                "pid": pid,
-                "name": "process_sort_index",
-                "args": {"sort_index": i},
-            }
-        )
-        # Render the layout at the window's peak-occupancy instant: the live set is
-        # disjoint in address, so no complete slice overlaps another on this track.
-        in_win = [b for b in bars if b["alloc_ord"] < e0 and b0 < b["free_ord"]]
-        t = _peak_ordinal(in_win, b0, e0)
-        live = sorted(
-            (b for b in in_win if b["alloc_ord"] <= t < b["free_ord"]),
-            key=lambda b: b["addr"],
-        )
-        for b in live:
-            offset = _x(b["addr"])
-            args = {
-                "size_MiB": round(b["size"] / (1024 * 1024), 3),
-                "size_bytes": b["size"],
-                "offset_bytes": offset,
-                "addr": hex(b["addr"]),
-                "pool_id": str(b["pool_id"]),
-                "slot_name": b.get("slot_name"),
-                "flags": ",".join(b["flags"]) or "none",
-                "window": label,
-                "alloc_ord": b["alloc_ord"],
-                "free_ord": b["free_ord"],
-            }
-            # Finding metadata only on flagged slices (no placeholder keys otherwise).
-            if b.get("finding_ids"):
-                args["finding_ids"] = ",".join(b["finding_ids"])
-                args["detectors"] = ",".join(b.get("finding_detectors") or [])
-                args["finding_impact"] = b.get("finding_impact", 0)
-                args["spanned_capture_windows"] = b.get(
-                    "finding_spanned_capture_windows", 0
-                )
-                args["spanned_segment_windows"] = b.get(
-                    "finding_spanned_segment_windows", 0
-                )
-                ft = result.get("finding_thresholds") or {}
-                args["finding_thresholds"] = ";".join(f"{k}={v}" for k, v in ft.items())
-            events.append(
-                {
-                    "ph": "X",  # complete slice: ts=offset, dur=size (x = memory)
-                    "pid": pid,
-                    "tid": 0,
-                    "cat": "alloc",
-                    # Perfetto renders every slice like a duration/function event and
-                    # formats ts/dur as time; bake the bytes into the name so the
-                    # rectangle reads as memory (width = size, position = offset).
-                    "name": f"{_hbytes(b['size'])} @ +{_hbytes(offset)}  {b['label']}",
-                    "ts": offset,
-                    "dur": max(b["size"], 1),
-                    "cname": _slice_cname(b),
-                    "args": args,
-                }
-            )
+    def run_end_of(addr: int) -> Optional[int]:
+        i = bisect.bisect_right(seg_starts, addr) - 1
+        if 0 <= i < len(seg_starts) and addr < seg_ends[i]:
+            return run_ends_by_seg[i]
+        return None  # outside every rendered segment -> caller skips clipping
 
     return {
-        "displayTimeUnit": "ns",
-        "traceEvents": events,
-        "metadata": {
-            "tool": "cg_mem_inspect",
-            "view": "memory map: x=packed pool offset (bytes), y=capture time (tracks top->bottom)",
-            "x_axis": "packed graph-pool offset (bytes): reserved segments concatenated "
-            "(inter-segment virtual gaps removed); slice width = allocation size",
-            "y_axis": "capture-order time as per-window tracks (earliest at top); not wall-clock",
-            "pool_base": hex(pool_base),
-            "packed_pool_bytes": packed_pool_bytes,
-            "num_segments": len(seg_starts),
-            "num_tracks": len(tracks),
-            "peak_live_MiB": round(result["peak_live_bytes"] / (1024 * 1024), 2),
-            "cross_graph_signature": result["cross_graph_signature"],
-            "finding_count": result.get("finding_count", 0),
-            "finding_thresholds": result.get("finding_thresholds", {}),
-        },
+        "x_of": x_of,
+        "packed_bytes": cursor,
+        "pool_base": pool_base,
+        "segs": segs,
+        "seg_packed": seg_packed,
+        "num_segments": len(seg_starts),
+        "run_end_of": run_end_of,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Native time x address memory map (self-contained interactive SVG, no deps).
+# --------------------------------------------------------------------------- #
+
+# Findings often number in the thousands (e.g. every per-layer activation matches the
+# oversized percentile), which would paint the whole map in detector colors and bury
+# the worst offenders. Only the top-K findings BY IMPACT keep the saturated color;
+# the rest are drawn in a washed-out tint of their detector color (still flagged,
+# still hoverable, still in the JSON).
+_MEMMAP_STRONG_FINDINGS = 300
+_UNDERLAY_GRID_PX = 2.0  # occupancy-underlay resolution (SVG user units)
+
+
+def _tint_hex(color: str, frac: float = 0.72) -> str:
+    """Mix a #rrggbb color toward white by ``frac`` (washed-out detector tint)."""
+    r, g, b = (int(color[i : i + 2], 16) for i in (1, 3, 5))
+    mix = lambda c: int(c + (255 - c) * frac)  # noqa: E731
+    return f"#{mix(r):02x}{mix(g):02x}{mix(b):02x}"
+
+
+def to_memmap_html(
+    result: dict,
+    title: str = "CUDA Graph Pool Memory Map",
+    max_rects: int = 12000,
+) -> str:
+    """Self-contained interactive **time × address** memory map (our own renderer).
+
+    Draws a true 2-D rectangle per allocation (so a tensor reads as memory, not as a
+    1-D duration/function slice):
+
+      * x-axis = packed graph-pool offset (segments concatenated; width = size);
+      * y-axis = capture-order time, top = first capture event, increasing downward;
+      * each allocation is a rectangle whose **height is its lifetime** — a buffer
+        freed within one capture is a thin band; one held to the end (never freed /
+        a weak-ref bridge) reaches the bottom.
+
+    Reading down a column shows how one pool region is reused over capture time; a
+    tall rectangle is a region a graph cannot reuse (non-reusable). Rectangles are
+    coloured by inefficiency detector; capture/segment windows are drawn as faint
+    horizontal guides. Pan = drag, zoom = wheel, double-click = reset.
+    """
+    if not result.get("gantt_available", True):
+        return _degraded_html(result, title)
+
+    bars = result.get("bars") or []
+    pk = _segment_packer(result)
+    x_of = pk["x_of"]
+    packed_bytes = max(pk["packed_bytes"], 1)
+    end = max(int(result.get("event_count", 1)), 1)
+    tracks = _memory_map_tracks(result)
+
+    # De-squeeze the time axis. A linear 0..event_count y-axis crushes graph-pool
+    # lifetimes into slivers: most of the ~event_count allocator events (and the
+    # empty pre-capture band) are NON-graph-pool, so the real allocations occupy a
+    # thin strip. Instead re-index time to the capture-order RANK of the ordinals
+    # that matter — every graph-pool alloc/free endpoint plus each window boundary —
+    # spacing those breakpoints equally so dense capture regions expand and empty
+    # spans collapse. (The x-axis already packs segments the same way.)
+    _bp = set()
+    for b in bars:
+        _bp.add(int(b["alloc_ord"]))
+        _bp.add(int(b["free_ord"]))
+    for _lbl, _b0, _e0 in tracks:
+        _bp.add(int(_b0))
+        _bp.add(int(_e0))
+    bp = sorted(_bp) or [0, end]
+    denom = max(len(bp) - 1, 1)
+
+    # SVG user-space plot box. The HEIGHT grows with the capture: the y-axis has one
+    # row per de-squeezed event boundary, so a bigger capture (more events / windows /
+    # segments) yields a taller canvas with room for blocks + labels, instead of
+    # cramming everything into a fixed height. ~1.6 px/boundary, clamped; the page
+    # scrolls for tall maps and wheel/drag still zoom the x (address) detail. Width is
+    # fixed (the address axis is zoomable).
+    PW = 1180
+    PH = int(max(760, min(denom * 1.6, 13000)))
+    ML, MR, MT, MB = 150, 64, 60, 30
+    W, H = ML + PW + MR, MT + PH + MB
+
+    def sx(addr: int) -> float:
+        return ML + (x_of(addr) / packed_bytes) * PW
+
+    def sw(size: int) -> float:
+        return max((size / packed_bytes) * PW, 0.5)
+
+    def _rank(ordn: int) -> float:
+        o = min(max(int(ordn), bp[0]), bp[-1])
+        i = bisect.bisect_right(bp, o) - 1
+        if i < 0:
+            return 0.0
+        if i >= len(bp) - 1:
+            return float(len(bp) - 1)
+        lo, hi = bp[i], bp[i + 1]
+        return i + (o - lo) / (hi - lo) if hi > lo else float(i)
+
+    def sy(ordn: int) -> float:
+        return MT + (_rank(ordn) / denom) * PH
+
+    def sh_pair(alloc: int, free: int) -> float:
+        return max(sy(free) - sy(alloc), 0.5)
+
+    # History-ring overflow: hatch the evicted y-range (events gone, windows render
+    # empty) and put a red banner above the map — never let a truncated capture
+    # read as "the first buckets allocate nothing".
+    trunc = result.get("history_truncation")
+    trunc_mark = ""
+    trunc_banner = ""
+    if trunc:
+        y_h = sy(int(trunc["first_kept_real_event_ord"]))
+        trunc_mark = (
+            f'<rect class="evic" x="{ML}" y="{MT}" width="{PW}" '
+            f'height="{max(y_h - MT, 2):.1f}"/>'
+        )
+        if y_h - MT >= 16:
+            trunc_mark += (
+                f'<text class="evict" x="{ML + 8}" y="{MT + 14}">events evicted '
+                f"(history ring overflowed) — windows in this range captured "
+                f"after recording wrapped</text>"
+            )
+        trunc_banner = (
+            '<div class="meta warnb">&#9888; allocator history ring overflowed '
+            f'(max_entries={trunc["max_entries"]}; device trace lens='
+            f'{trunc["device_trace_lens"]}). Events before ordinal '
+            f'{trunc["first_kept_real_event_ord"]} were evicted: '
+            f'{trunc["evicted_windows"]}/{trunc["total_windows"]} windows render '
+            f"empty (hatched band) and bucket attribution after the horizon may be "
+            f"shifted. Re-capture with a larger <code>CG_MEM_INSPECT_MAX_ENTRIES</code> "
+            f"or fewer shapes for a trustworthy map.</div>"
+        )
+
+    # Saturated color only for the top-K findings by impact; muted tint for the rest.
+    findings = result.get("findings") or []
+    strong_impact = (
+        findings[min(_MEMMAP_STRONG_FINDINGS, len(findings)) - 1]["impact"]
+        if findings
+        else 0
+    )
+
+    def _is_strong(b: dict) -> bool:
+        return (
+            bool(b.get("finding_ids")) and b.get("finding_impact", 0) >= strong_impact
+        )
+
+    # Cap priority: the top-K-impact findings always survive; everything else (muted
+    # findings included — captures can carry thousands) competes by size, so the map
+    # keeps its unflagged context instead of rendering flagged rects only. Draw
+    # unflagged first and flagged last so findings sit on top.
+    ordered = sorted(bars, key=lambda b: (0 if _is_strong(b) else 1, -b["size"]))
+    shown = ordered[:max_rects]
+    omitted = len(bars) - len(shown)
+    shown.sort(key=lambda b: 1 if b.get("finding_ids") else 0)
+
+    run_end_of = pk["run_end_of"]
+
+    def _draw_size(b: dict) -> Tuple[int, int]:
+        """(drawn_size, clipped_bytes): width clipped at the VA-contiguous run end so
+        a stale final-layout segment never bleeds into the NEXT packed segment."""
+        re_ = run_end_of(b["addr"])
+        if re_ is None or b["addr"] + b["size"] <= re_:
+            return b["size"], 0
+        return re_ - b["addr"], b["addr"] + b["size"] - re_
+
+    rects: List[str] = []
+    labels: List[dict] = (
+        []
+    )  # per-block on-rect labels, revealed by zoom (level-of-detail)
+    for b in shown:
+        dsize, clipped = _draw_size(b)
+        x, w = sx(b["addr"]), sw(dsize)
+        y, h = sy(b["alloc_ord"]), sh_pair(b["alloc_ord"], b["free_ord"])
+        dets = (
+            ", ".join(
+                _DETECTOR_HTML_LABEL.get(d, d)
+                for d in (b.get("finding_detectors") or [])
+            )
+            or "ok"
+        )
+        free = "END" if b["never_freed"] else str(b["free_ord"])
+        info = (
+            f"{b['label']} | {_hbytes(b['size'])} @ +{_hbytes(x_of(b['addr']))} | "
+            f"ord {b['alloc_ord']}→{free} | pool {b['pool_id']} | {dets}"
+            + (
+                f" | impact {b.get('finding_impact', 0)}"
+                if b.get("finding_ids")
+                else ""
+            )
+            + (
+                f" | width clipped {_hbytes(clipped)} at segment-run end"
+                if clipped
+                else ""
+            )
+        )
+        cls = "f" if b.get("finding_ids") else "n"
+        color = _bar_color(b)
+        if b.get("finding_ids") and b.get("finding_impact", 0) < strong_impact:
+            color = _tint_hex(color)
+        rects.append(
+            f'<rect class="{cls}" x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" '
+            f'height="{h:.2f}" fill="{color}" data-d="{html.escape(info, quote=True)}">'
+            f"<title>{html.escape(info)}</title></rect>"
+        )
+        # On-block text = call-site location + size. The loc is the (file:line) inside
+        # the frame label, e.g. "fused_norm_residual.py:371".
+        m = re.search(r"\(([^)]+)\)", b["label"])
+        loc = m.group(1) if m else b["label"]
+        labels.append(
+            {
+                "x": round(x, 1),
+                "y": round(y, 1),
+                "w": round(w, 1),
+                "h": round(h, 1),
+                "t": html.escape(f"{loc} · {_hbytes(b['size'])}"),
+            }
+        )
+
+    # Occupancy underlay for the bars beyond ``max_rects``: without it, dense regions
+    # whose (small) allocations lost the cap race would render as FALSE free holes.
+    # Rasterize the omitted rects onto a coarse column grid, merge the per-column
+    # y-intervals, and emit ONE gray path under the interactive rects — every
+    # occupied region stays visibly occupied at negligible file/DOM cost.
+    under_cols: Dict[int, List[Tuple[float, float]]] = {}
+    for b in ordered[max_rects:]:
+        dsize, _ = _draw_size(b)
+        x, w = sx(b["addr"]), sw(dsize)
+        y, h = sy(b["alloc_ord"]), sh_pair(b["alloc_ord"], b["free_ord"])
+        c0 = int((x - ML) / _UNDERLAY_GRID_PX)
+        c1 = int((x + w - ML) / _UNDERLAY_GRID_PX)
+        for c in range(c0, c1 + 1):
+            under_cols.setdefault(c, []).append((y, y + h))
+    under_parts: List[str] = []
+    for c, ivals in sorted(under_cols.items()):
+        ivals.sort()
+        x = ML + c * _UNDERLAY_GRID_PX
+        cur_lo, cur_hi = ivals[0]
+        for lo, hi in ivals[1:]:
+            if lo <= cur_hi + 0.5:
+                cur_hi = max(cur_hi, hi)
+            else:
+                under_parts.append(
+                    f"M{x:.1f} {cur_lo:.1f}h{_UNDERLAY_GRID_PX}V{cur_hi:.1f}h-{_UNDERLAY_GRID_PX}Z"
+                )
+                cur_lo, cur_hi = lo, hi
+        under_parts.append(
+            f"M{x:.1f} {cur_lo:.1f}h{_UNDERLAY_GRID_PX}V{cur_hi:.1f}h-{_UNDERLAY_GRID_PX}Z"
+        )
+    underlay = f'<path class="uo" d="{"".join(under_parts)}"/>' if under_parts else ""
+
+    # Vertical segment boundaries, labeled with the ABSOLUTE packed offset of each
+    # boundary (0 B, 768 MiB, 1.7 GiB, ... — the packed x-axis is cumulative, so
+    # boundary offsets read as ticks and the deltas between them read as segment
+    # sizes). Tiny segments are common (dozens of 2 MiB segments side by side), so
+    # labels place greedily left-to-right: a boundary whose label would overlap the
+    # previous kept one is skipped. Hovering a label gives the segment's address +
+    # reserved size; the right edge carries the total packed size.
+    _SEGT_CHAR_PX = 6.5  # ~11px sans glyph width
+    seg_marks: List[str] = []
+    last_end = -1e9
+    for i, s in enumerate(pk["segs"]):
+        x = sx(s["address"])
+        seg_marks.append(
+            f'<line class="seg" x1="{x:.2f}" y1="{MT}" x2="{x:.2f}" y2="{MT + PH}"/>'
+        )
+        txt = _hbytes(pk["seg_packed"][i])
+        if x + 3 >= last_end + 10:
+            info = (
+                f'+{txt}: seg 0x{s["address"]:x} · '
+                f"{_hbytes(s['total_size'])} reserved"
+            )
+            seg_marks.append(
+                f'<text class="segt" x="{x + 3:.2f}" y="{MT - 18}">{html.escape(txt)}'
+                f"<title>{html.escape(info)}</title></text>"
+            )
+            last_end = x + 3 + _SEGT_CHAR_PX * len(txt)
+    seg_marks.append(
+        f'<line class="seg" x1="{ML + PW:.2f}" y1="{MT}" x2="{ML + PW:.2f}" y2="{MT + PH}"/>'
+    )
+    total_txt = _hbytes(packed_bytes)
+    if ML + PW - 3 - _SEGT_CHAR_PX * len(total_txt) >= last_end + 10:
+        seg_marks.append(
+            f'<text class="segt" x="{ML + PW - 3:.2f}" y="{MT - 18}" '
+            f'text-anchor="end">{html.escape(total_txt)}'
+            f"<title>total packed pool ({total_txt} reserved)</title></text>"
+        )
+
+    # ---- y-axis capture structure ----------------------------------------------
+    # Breakable capture runs bucket-by-bucket (large token bucket -> small) and,
+    # within a bucket, segment/layer-by-layer (seg 0,1,2,...). Annotate the left
+    # margin with that structure — a labeled bracket per token bucket and a layer
+    # index per segment window — and shade alternate buckets so the relation between
+    # y-position and (token bucket, segment) is readable across the whole map.
+    def _bucket_sub(w: dict, runner: str) -> Tuple[str, str]:
+        # A None sub-index (e.g. stream_idx on single-stream captures) is noise, not
+        # a label — render nothing rather than "sNone".
+        if runner == "breakable":
+            si = w.get("segment_idx")
+            return f"nt={w.get('num_tokens')}", "" if si is None else str(si)
+        if runner in _STANDARD_LIKE_RUNNERS:
+            si = w.get("stream_idx")
+            return f"bs={w.get('batch_size')}", "" if si is None else f"s{si}"
+        if runner == "piecewise":
+            return f"nt={w.get('num_tokens')}", ""
+        return "", ""
+
+    lanes: List[Tuple[int, int, str, str]] = []  # (begin, end, bucket, sub)
+    reps = result.get("reports") or {}
+    for runner in _ALL_RUNNERS:
+        for w in reps.get(runner) or []:
+            b0, e0 = w.get("begin_ord"), w.get("end_ord")
+            if b0 is None or e0 is None:
+                continue
+            bk, sub = _bucket_sub(w, runner)
+            lanes.append((int(b0), int(e0), bk, sub))
+    lanes.sort()
+
+    # Per-window guide lines + per-segment (layer) index labels are drawn by JS with
+    # collision-avoidance + LOD: a breakable capture has THOUSANDS of segment windows
+    # whose static lines would tint the whole canvas, and a short segment can land
+    # ~2 px from the next so adjacent indices would overlap at the overview. Bucket
+    # boundaries (the first window of each token bucket / batch size) always draw;
+    # intra-bucket window lines and the rest of the index labels appear as zoom makes
+    # room for them.
+    seglabels: List[dict] = []
+    winlines: List[dict] = []  # {y, b: 1 = bucket boundary, 0 = intra-bucket}
+    seen_buckets: set = set()
+    for b0, _e0, bk, sub in lanes:
+        y = sy(b0)
+        tier = 1 if bk and bk not in seen_buckets else 0
+        seen_buckets.add(bk)
+        winlines.append({"y": round(y, 1), "b": tier})
+        if sub:
+            seglabels.append({"y": round(y, 1), "t": html.escape(sub)})
+
+    # Token-bucket bands: group lanes by bucket (capture order), shade + bracket + label.
+    bands: List[str] = []
+    bucket_marks: List[str] = []
+    order: List[str] = []
+    spans: Dict[str, List[int]] = {}
+    for b0, e0, bk, _sub in lanes:
+        if not bk:
+            continue
+        if bk not in spans:
+            spans[bk] = [b0, e0]
+            order.append(bk)
+        else:
+            spans[bk][0] = min(spans[bk][0], b0)
+            spans[bk][1] = max(spans[bk][1], e0)
+    bx = ML - 30
+    for i, bk in enumerate(order):
+        y0, y1 = sy(spans[bk][0]), sy(spans[bk][1])
+        if i % 2 == 0:
+            bands.append(
+                f'<rect class="band" x="{ML}" y="{y0:.1f}" width="{PW}" height="{max(y1 - y0, 1):.1f}"/>'
+            )
+        cy = (y0 + y1) / 2
+        bucket_marks.append(
+            f'<path class="brk" d="M{bx + 5} {y0:.1f} H{bx} V{y1:.1f} H{bx + 5}"/>'
+            f'<text class="bkt" x="{bx - 8:.1f}" y="{cy:.1f}" text-anchor="middle" '
+            f'transform="rotate(-90 {bx - 8:.1f} {cy:.1f})">{html.escape(bk)}</text>'
+        )
+
+    # Event-ordinal (y) ticks down the RIGHT side. The y-axis is compressed
+    # (rank-spaced), so each tick prints the REAL event ordinal at that height (not a
+    # linear fraction of event_count). The x-axis carries NO tick row: fractional
+    # byte ticks would stack a second, redundant byte row above the segment labels —
+    # the segment boundaries ARE the x structure (sizes in the header, exact offsets
+    # on rect hover, total pool size in the meta line).
+    ticks: List[str] = []
+    for i in range(21):
+        frac = i / 20
+        y = MT + frac * PH
+        raw_ord = bp[min(int(round(frac * denom)), len(bp) - 1)]
+        ticks.append(
+            f'<text class="tk" x="{ML + PW + 6:.1f}" y="{y + 4:.1f}" text-anchor="start">{raw_ord}</text>'
+        )
+
+    n_muted = sum(
+        1
+        for b in shown
+        if b.get("finding_ids") and b.get("finding_impact", 0) < strong_impact
+    )
+    legend = (
+        "".join(
+            f'<span class="lg"><span class="sw" style="background:{_DETECTOR_HEX[k]}"></span>'
+            f"{html.escape(_DETECTOR_HTML_LABEL[k])}</span>"
+            for k in _DETECTOR_PRECEDENCE
+        )
+        + f'<span class="lg"><span class="sw" style="background:{_NORMAL_HEX}"></span>no finding</span>'
+    )
+    if n_muted:
+        legend += (
+            f'<span class="lg"><span class="sw" style="background:{_tint_hex("#d62728")}"></span>'
+            f"washed-out = finding below top-{_MEMMAP_STRONG_FINDINGS} impact</span>"
+        )
+    if omitted:
+        legend += (
+            '<span class="lg"><span class="sw" style="background:#bbb"></span>'
+            "gray = occupancy of small allocs not individually drawn</span>"
+        )
+
+    fc = result.get("finding_counts", {})
+    bucket_brief = "/".join(order) if order else "time"
+    omit_brief = (
+        f" ({len(shown)} interactive, {omitted} smallest as gray underlay)"
+        if omitted
+        else ""
+    )
+    body = "".join(rects)
+    labels_json = json.dumps(labels)
+    seg_json = json.dumps(seglabels)
+    win_json = json.dumps(winlines)
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>
+body{{font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;margin:14px;color:#1c1c1c}}
+h1{{font-size:17px;margin:0 0 4px}} .meta{{color:#555;margin:2px 0}}
+#wrap{{border:1px solid #ccc;border-radius:4px;overflow:visible;margin-top:8px}}
+svg{{display:block;width:100%;height:auto;background:#fff;cursor:grab;touch-action:pan-y}}
+svg.drag{{cursor:grabbing}}
+rect.n{{stroke:#333;stroke-width:.6;vector-effect:non-scaling-stroke;opacity:.92}}
+rect.f{{stroke:#000;stroke-width:.8;vector-effect:non-scaling-stroke;opacity:.96}}
+rect:hover{{stroke:#000;stroke-width:1.8;vector-effect:non-scaling-stroke;opacity:1}}
+text.bl{{fill:#111;paint-order:stroke;stroke:#fff;stroke-linejoin:round;pointer-events:none;
+text-anchor:middle;dominant-baseline:central;font-family:ui-monospace,Menlo,Consolas,monospace}}
+line.seg{{stroke:#444;stroke-width:1;vector-effect:non-scaling-stroke}}
+text.segt{{fill:#444;font-size:11px}}
+line.win{{stroke:#1f77b4;stroke-width:.5;opacity:.22;vector-effect:non-scaling-stroke}}
+line.winb{{stroke:#1f77b4;stroke-width:1;opacity:.45;vector-effect:non-scaling-stroke}}
+path.uo{{fill:#999;opacity:.35;pointer-events:none}}
+rect.evic{{fill:url(#hatch);pointer-events:none}}
+text.evict{{fill:#8b1a1a;font-size:12px;font-weight:600}}
+.warnb{{background:#fdecea;border:1px solid #f1b0b7;color:#7a1212;padding:6px 9px;border-radius:4px}}
+text.subt{{fill:#1f77b4;opacity:.85;pointer-events:none;font-family:ui-monospace,Menlo,Consolas,monospace}}
+rect.band{{fill:#1f77b4;opacity:.05}}
+path.brk{{fill:none;stroke:#555;stroke-width:1.2;vector-effect:non-scaling-stroke}}
+text.bkt{{fill:#222;font-size:13px;font-weight:700}}
+text.tk{{fill:#888;font-size:11px}}
+.axt{{fill:#333;font-size:12px;font-weight:600}}
+.lg{{margin-right:14px;white-space:nowrap}} .sw{{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:4px;vertical-align:middle}}
+#tip{{position:fixed;display:none;max-width:560px;background:#111;color:#eee;padding:6px 8px;border-radius:4px;font-size:12px;pointer-events:none;z-index:9;box-shadow:0 2px 8px #0005}}
+button{{font:12px inherit;padding:3px 9px;margin-left:8px}}
+</style></head><body>
+<h1>{html.escape(title)}</h1>
+<div class="meta">y = capture order ({html.escape(bucket_brief)} × seg, top→bottom) · x = packed pool offset ·
+rect = alloc (w=size, h=lifetime) · pool <b>{_hbytes(packed_bytes)}</b>, peak <b>{_mib(result['peak_live_bytes'])}</b> ·
+findings <b>{fc.get('oversized_capture_allocation', 0)}</b> oversized,
+<b>{fc.get('non_reusable_across_graphs', 0)}</b> non-reusable,
+<b>{fc.get('long_lived_outlier', 0)}</b> long-lived · {len(bars)} allocs{omit_brief}</div>
+<div class="meta">{legend}<button onclick="reset()">reset</button>
+&nbsp;<span style="color:#888">scroll the page for tall maps · drag to pan · ctrl/⌘+wheel to zoom · hover for detail (labels appear as you zoom)</span></div>
+{trunc_banner}
+<div id="wrap"><svg id="mm" viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMin meet">
+<defs><pattern id="hatch" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+<rect width="8" height="8" fill="#fff5f5"/><line x1="0" y1="0" x2="0" y2="8" stroke="#d62728" stroke-width="1" opacity=".3"/></pattern></defs>
+<g id="vp">
+<rect x="{ML}" y="{MT}" width="{PW}" height="{PH}" fill="#fbfbfb" stroke="#ddd" stroke-width="1" vector-effect="non-scaling-stroke"/>
+{''.join(bands)}
+{trunc_mark}
+{underlay}
+<g id="winlines"></g>
+{''.join(seg_marks)}
+{body}
+<g id="labels"></g>
+<g id="seglabels"></g>
+{''.join(bucket_marks)}
+{''.join(ticks)}
+<text class="axt" x="{ML + PW / 2:.0f}" y="18" text-anchor="middle">memory offset (packed bytes) →</text>
+<text class="axt" x="18" y="{MT + PH / 2:.0f}" text-anchor="middle" transform="rotate(-90 18 {MT + PH / 2:.0f})">↓ capture order: token bucket / segment (layer)</text>
+<text class="axt" x="{W - 14}" y="{MT + PH / 2:.0f}" text-anchor="middle" transform="rotate(-90 {W - 14} {MT + PH / 2:.0f})">event ordinal ↓</text>
+</g></svg></div>
+<div id="tip"></div>
+<script>
+var svg=document.getElementById('mm'),vp=document.getElementById('vp'),tip=document.getElementById('tip');
+var lg=document.getElementById('labels'),L={labels_json};
+var sg=document.getElementById('seglabels'),SEG={seg_json};
+var wg=document.getElementById('winlines'),WIN={win_json};
+L.sort(function(a,b){{return b.w*b.h-a.w*a.h;}});  // label the biggest blocks first
+var s=1,tx=0,ty=0,drag=false,lx=0,ly=0;
+function k(){{return svg.viewBox.baseVal.width/svg.getBoundingClientRect().width;}}
+// Level-of-detail labels: each block's loc+size is sized to FIT the block (large
+// blocks get large, centered text), rotated vertically when the block is tall and
+// narrow, and drawn only once it renders big enough to read at the current zoom —
+// so zooming in reveals labels on progressively smaller blocks. Every block also
+// shows its full detail on hover.
+function relabel(){{
+ var kk=k(),vbw=svg.viewBox.baseVal.width,vbh=svg.viewBox.baseVal.height;
+ var x0=(0-tx)/s,x1=(vbw-tx)/s,y0=(0-ty)/s,y1=(vbh-ty)/s;
+ // Declutter: place a label only if its on-screen cell is free (biggest blocks win,
+ // since L is area-sorted), so labels never pile up. Zoom in -> cells free up ->
+ // more labels appear. CW/CH ~ a label's screen footprint in px.
+ var out=[],cap=700,MINPX=6,placed={{}},CW=88,CH=13;
+ for(var i=0;i<L.length;i++){{var b=L[i];
+  if(b.x>x1||b.x+b.w<x0||b.y>y1||b.y+b.h<y0) continue;        // off-screen
+  var n=b.t.length||1,cx=b.x+b.w/2,cy=b.y+b.h/2,vert=b.h>b.w*1.3;
+  var along=vert?b.h:b.w,across=vert?b.w:b.h;                 // text runs along the long side
+  var F=Math.min(across*0.82,along*0.94/(n*0.58));            // fit height & width (user units)
+  if(F*s/kk<MINPX) continue;                                  // too small to read now -> LOD skip
+  var key=Math.round((tx+cx*s)/kk/CW)+','+Math.round((ty+cy*s)/kk/CH);
+  if(placed[key]) continue;                                   // a label already occupies this spot
+  placed[key]=1;
+  var tr=vert?(' transform="rotate(-90 '+cx.toFixed(1)+' '+cy.toFixed(1)+')"'):'';
+  out.push('<text class="bl" x="'+cx.toFixed(1)+'" y="'+cy.toFixed(1)+'" font-size="'+F.toFixed(2)+
+           '" stroke-width="'+(F*0.16).toFixed(2)+'"'+tr+'>'+b.t+'</text>');
+  if(out.length>=cap) break;
+ }}
+ lg.innerHTML=out.join('');
+ // segment-index labels down the left margin, kept at a constant ~9px and deduped
+ // so adjacent indices never overlap; zooming in spreads them so the rest appear.
+ var so=[],lastY=-1e9,fy=9*kk/s;
+ for(var j=0;j<SEG.length;j++){{var g=SEG[j];
+  if(g.y<y0||g.y>y1) continue;                 // off-screen
+  if((g.y-lastY)*s/kk<10.5) continue;          // would collide with last kept -> skip
+  lastY=g.y;
+  so.push('<text class="subt" x="{ML - 8}" y="'+(g.y+fy*0.34).toFixed(1)+'" text-anchor="end" font-size="'+fy.toFixed(2)+'">'+g.t+'</text>');
+ }}
+ sg.innerHTML=so.join('');
+ // Per-window guide lines, LOD-throttled: a breakable capture has thousands of
+ // segment windows whose static lines would tint the whole canvas. Token-bucket
+ // boundaries (b=1) always draw; intra-bucket lines only once they resolve to
+ // >= ~7 px apart at the current zoom.
+ var wo=[],lastW=-1e9;
+ for(var j=0;j<WIN.length;j++){{var g=WIN[j];
+  if(g.y<y0||g.y>y1){{if(g.b)lastW=g.y;continue;}}
+  if(!g.b&&(g.y-lastW)*s/kk<7) continue;
+  lastW=g.y;
+  wo.push('<line class="'+(g.b?'winb':'win')+'" x1="{ML}" y1="'+g.y+'" x2="{ML + PW}" y2="'+g.y+'"/>');
+ }}
+ wg.innerHTML=wo.join('');
+}}
+// Static axis/segment/bucket text must stay a constant SCREEN size: zooming the
+// viewport would otherwise blow the labels up over the data (they live inside #vp).
+var FS={{tk:11,segt:11,bkt:13,axt:12,evict:12}};
+var SCALED=[].slice.call(svg.querySelectorAll('text.tk,text.segt,text.bkt,text.axt,text.evict'));
+function refont(){{var z=Math.max(s,1);
+ for(var i=0;i<SCALED.length;i++){{var t=SCALED[i];
+  t.style.fontSize=(FS[t.getAttribute('class')]/z)+'px';}}}}
+function ap(){{vp.setAttribute('transform','translate('+tx+','+ty+') scale('+s+')');refont();relabel();}}
+function reset(){{s=1;tx=0;ty=0;ap();}}
+svg.addEventListener('wheel',function(e){{if(!(e.ctrlKey||e.metaKey))return;  // plain wheel scrolls the page; ctrl/cmd+wheel zooms
+ e.preventDefault();var r=svg.getBoundingClientRect();
+ var mx=(e.clientX-r.left)*k(),my=(e.clientY-r.top)*k();var f=e.deltaY<0?1.15:1/1.15;
+ tx=mx-(mx-tx)*f;ty=my-(my-ty)*f;s*=f;ap();}},{{passive:false}});
+svg.addEventListener('mousedown',function(e){{drag=true;lx=e.clientX;ly=e.clientY;svg.classList.add('drag');}});
+window.addEventListener('mouseup',function(){{drag=false;svg.classList.remove('drag');}});
+window.addEventListener('mousemove',function(e){{if(!drag)return;var f=k();tx+=(e.clientX-lx)*f;ty+=(e.clientY-ly)*f;lx=e.clientX;ly=e.clientY;ap();}});
+svg.addEventListener('dblclick',reset);
+svg.addEventListener('mousemove',function(e){{var t=e.target;
+ if(t.tagName==='rect'&&t.dataset.d){{tip.style.display='block';tip.textContent=t.dataset.d;
+  tip.style.left=Math.min(e.clientX+14,innerWidth-tip.offsetWidth-8)+'px';tip.style.top=(e.clientY+14)+'px';}}
+ else{{tip.style.display='none';}}}});
+window.addEventListener('resize',relabel);relabel();
+</script>
+</body></html>"""
 
 
 def _load_json(path):
@@ -1809,19 +2299,30 @@ def _run_one(
     base = os.path.splitext(os.path.basename(snapshot_path))[0]
     json_path = os.path.join(out_dir, f"{base}.analysis.json")
     html_path = os.path.join(out_dir, f"{base}.gantt.html")
-    perfetto_path = os.path.join(out_dir, f"{base}.perfetto.json")
+    memmap_path = os.path.join(out_dir, f"{base}.memmap.html")
     with open(json_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
     with open(html_path, "w") as f:
         f.write(to_html(result, title=args.title, max_rows=args.max_rows))
-    with open(perfetto_path, "w") as f:
-        json.dump(to_perfetto(result), f, default=str)
+    with open(memmap_path, "w") as f:
+        f.write(to_memmap_html(result, title=args.title))
 
     print(
         f"[{base}] rank={result.get('rank')} world={result.get('world')} "
         f"availability={result['availability_source']} layout={result['layout_available']} "
         f"lifetime={result['lifetime_available']} gantt={result['gantt_available']}"
     )
+    trunc = result.get("history_truncation")
+    if trunc:
+        print(
+            f"WARNING: history ring OVERFLOWED (max_entries={trunc['max_entries']}, "
+            f"device trace lens={trunc['device_trace_lens']}): events before ord "
+            f"{trunc['first_kept_real_event_ord']} evicted; "
+            f"{trunc['evicted_windows']}/{trunc['total_windows']} windows fully "
+            f"evicted and later attribution may be SHIFTED. Re-capture with "
+            f"CG_MEM_INSPECT_MAX_ENTRIES > total events or fewer shapes.",
+            file=sys.stderr,
+        )
     rep = result.get("reports") or {}
     print(
         f"reports: standard={len(rep.get('standard') or [])} "
@@ -1845,7 +2346,7 @@ def _run_one(
         print(f"cross-graph: {result['cross_graph_signature']}")
     else:
         print("Gantt/lifetime DISABLED (degraded layout-only report).")
-    print(f"JSON: {json_path}  HTML: {html_path}  Perfetto: {perfetto_path}")
+    print(f"JSON: {json_path}  MemMap: {memmap_path}  Gantt: {html_path}")
     return 0
 
 
@@ -1928,7 +2429,7 @@ def _run_artifact_dir(args) -> int:
 # --------------------------------------------------------------------------- #
 
 _SHAPE_KEY_BY_RUNNER = {
-    "standard": "batch_size",
+    **{r: "batch_size" for r in _STANDARD_LIKE_RUNNERS},
     "piecewise": "num_tokens",
     "breakable": "num_tokens",
 }
@@ -1943,7 +2444,7 @@ def _high_water_rows(result: dict) -> Dict[Tuple, dict]:
     the pool's reserved total."""
     rows: Dict[Tuple, dict] = {}
     reps = result.get("reports") or {}
-    for runner in ("standard", "piecewise", "breakable"):
+    for runner in _ALL_RUNNERS:
         shape_field = _SHAPE_KEY_BY_RUNNER[runner]
         for w in reps.get(runner) or []:
             shape = w.get(shape_field)

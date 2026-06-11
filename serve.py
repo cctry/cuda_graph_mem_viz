@@ -1,68 +1,33 @@
-"""Serve cg_mem_inspect traces so the Perfetto web UI renders the memory map.
+"""Serve cg_mem_inspect memory-map HTML over a plain HTTP server.
 
-Perfetto (https://ui.perfetto.dev) opens a trace straight from a URL when the
-hosting server sends CORS headers. This starts such a server over the artifacts
-directory and prints a ready-to-open ``ui.perfetto.dev/#!/?url=...`` deep link for
-every ``*.perfetto.json`` — no manual file upload needed.
+The ``*.memmap.html`` files are self-contained (open one directly after ``scp``).
+This is just a convenience for viewing them on a remote (IPv6-only) devserver
+without copying: it serves the artifacts directory and prints a link per memory
+map. Forward the port from your laptop, then open a printed link:
 
-Run:
     uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py [--port 8099]
-
-The link defaults to ``http://localhost:<port>`` because Perfetto's HTTPS page can
-only fetch an ``http://`` trace from **localhost** (a remote host is blocked as
-mixed content). From your laptop, forward the port and click the link:
-    ssh -L 8099:localhost:8099 <this-devserver>
-If your browser can reach this machine directly, pass ``--host <fqdn>`` instead.
-
-``--link-only`` prints the links and exits (no server); or just drag a
-``*.perfetto.json`` onto https://ui.perfetto.dev.
+    ssh -L 8099:localhost:8099 <devserver>
 """
 
 from __future__ import annotations
 
 import argparse
-import gzip
 import http.server
 import os
-import shutil
 import socket
-import subprocess
 import sys
-import time
-import urllib.parse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# Default to ./cg_mem_artifacts in the launch directory (matches launch.py / shim);
-# override with --dir.
+# Default to ./cg_mem_artifacts in the launch directory (matches launch.py / shim).
 _ARTIFACTS = os.path.join(os.getcwd(), "cg_mem_artifacts")
-
-
-class _CORSHandler(http.server.SimpleHTTPRequestHandler):
-    """Static handler that lets the Perfetto web origin fetch the trace."""
-
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header(
-            "Access-Control-Expose-Headers", "Content-Length, Content-Range"
-        )
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def do_OPTIONS(self):  # CORS preflight (e.g. when Perfetto sends a Range header)
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Range")
-        self.end_headers()
-
-    def log_message(self, fmt, *args):
-        sys.stderr.write("[serve] " + (fmt % args) + "\n")
 
 
 class _DualStackServer(http.server.ThreadingHTTPServer):
     address_family = socket.AF_INET6
 
     def server_bind(self):
-        # Accept both IPv6 and IPv4-mapped clients where the OS permits.
+        # Accept both IPv6 and IPv4-mapped clients where the OS permits (the cluster
+        # is IPv6-only; python -m http.server binds IPv4 only).
         try:
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         except (AttributeError, OSError):
@@ -70,126 +35,39 @@ class _DualStackServer(http.server.ThreadingHTTPServer):
         super().server_bind()
 
 
-def _perfetto_link(host: str, port: int, filename: str) -> str:
-    url = f"http://{host}:{port}/{urllib.parse.quote(filename)}"
-    return "https://ui.perfetto.dev/#!/?url=" + urllib.parse.quote(url, safe="")
-
-
-def _kernelhub_link(bucket: str, trace_path: str) -> str:
-    """internalfb kernelhub Perfetto viewer link for a Manifold-hosted trace."""
-    return (
-        "https://www.internalfb.com/intern/kernelhub/perfetto/"
-        f"?bucket={bucket}&trace_path={trace_path.replace('/', '%2F')}"
-    )
-
-
-def _publish(traces, bucket: str, subdir: str) -> int:
-    """Gzip each trace, upload to Manifold under <bucket>/<subdir>, and print an
-    internalfb kernelhub Perfetto link (no local server / SSH tunnel needed)."""
-    try:
-        subprocess.run(
-            ["manifold", "mkdirs", f"{bucket}/{subdir}"], capture_output=True
-        )
-    except FileNotFoundError:
-        print("[serve] 'manifold' CLI not found — cannot --publish.", file=sys.stderr)
-        return 2
-    published = 0
-    for f in traces:
-        gz = f + ".gz"
-        with open(f, "rb") as src, gzip.open(gz, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        dest = f"{subdir}/{f}.gz"
-        try:
-            r = subprocess.run(
-                ["manifold", "put", gz, f"{bucket}/{dest}", "--overwrite"],
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-        finally:
-            os.remove(gz)
-        if r.returncode != 0:
-            print(
-                f"[serve] manifold upload failed for {f}: {r.stderr[:200]}",
-                file=sys.stderr,
-            )
-            continue
-        published += 1
-        print(
-            f"\n  {f}\n  → Perfetto (kernelhub, no tunnel):\n"
-            f"    {_kernelhub_link(bucket, dest)}\n"
-        )
-    return 0 if published else 2
+class _Handler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[serve] " + (fmt % args) + "\n")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=8099)
-    ap.add_argument(
-        "--host",
-        default=os.environ.get("CG_MEM_SERVE_HOST") or "localhost",
-        help="host embedded in the Perfetto link. Default 'localhost' (forward the "
-        "port with `ssh -L <port>:localhost:<port> <devserver>`); pass an FQDN your "
-        "browser can reach directly to skip the tunnel.",
-    )
     ap.add_argument("--dir", default=_ARTIFACTS)
-    ap.add_argument(
-        "--link-only",
-        action="store_true",
-        help="print the Perfetto deep links and exit (do not start the server)",
-    )
-    ap.add_argument(
-        "--publish",
-        action="store_true",
-        help="upload each trace to Manifold and print an internalfb kernelhub "
-        "Perfetto link (no local server / SSH tunnel needed)",
-    )
-    ap.add_argument(
-        "--bucket", default="gpu_traces", help="Manifold bucket for --publish"
-    )
     args = ap.parse_args()
 
     if not os.path.isdir(args.dir):
         print(f"[serve] no artifacts dir: {args.dir}", file=sys.stderr)
         return 2
     os.chdir(args.dir)
-    traces = sorted(f for f in os.listdir(".") if f.endswith(".perfetto.json"))
-
-    if not traces:
+    maps = sorted(f for f in os.listdir(".") if f.endswith(".memmap.html"))
+    if not maps:
         print(
-            f"[serve] no *.perfetto.json in {args.dir} — run the analyzer first.",
+            f"[serve] no *.memmap.html in {args.dir} — run the analyzer first.",
             file=sys.stderr,
         )
         return 2
 
-    if args.publish:
-        host = socket.gethostname().split(".")[0]
-        subdir = f"tree/traces/cg_mem_inspect/{time.strftime('%Y%m%d-%H%M%S')}/{host}"
-        return _publish(traces, args.bucket, subdir)
-
-    for f in traces:
-        print(
-            f"\n  {f}\n  → open in Perfetto web:\n    {_perfetto_link(args.host, args.port, f)}\n"
-        )
-
-    if args.link_only:
-        if args.host in ("localhost", "127.0.0.1", "::1"):
-            print(
-                f"[serve] start the server (no --link-only) or forward the port, then "
-                f"open the link(s):\n    ssh -L {args.port}:localhost:{args.port} "
-                f"{socket.getfqdn()}"
-            )
-        return 0
-
-    print(f"[serve] serving {args.dir} on [::]:{args.port} (CORS enabled)")
-    if args.host in ("localhost", "127.0.0.1", "::1"):
-        print(
-            f"[serve] from your browser's machine, forward the port first:\n"
-            f"    ssh -L {args.port}:localhost:{args.port} {socket.getfqdn()}"
-        )
-    print("[serve] Ctrl-C to stop.")
+    for f in maps:
+        print(f"  http://localhost:{args.port}/{f}")
+    print(
+        f"[serve] serving {args.dir} on [::]:{args.port}\n"
+        f"[serve] forward the port from your laptop, then open a link above:\n"
+        f"    ssh -L {args.port}:localhost:{args.port} {socket.getfqdn()}\n"
+        f"[serve] Ctrl-C to stop."
+    )
     try:
-        _DualStackServer(("::", args.port), _CORSHandler).serve_forever()
+        _DualStackServer(("::", args.port), _Handler).serve_forever()
     except KeyboardInterrupt:
         print("\n[serve] stopped.")
     return 0

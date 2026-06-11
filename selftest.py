@@ -18,7 +18,7 @@ try:
         _run_compare_ranks,
         analyze,
         to_html,
-        to_perfetto,
+        to_memmap_html,
     )
     from .schema import SchemaError, normalize
     from .shim import _window_key
@@ -29,7 +29,7 @@ except ImportError:  # run directly by path
         _run_compare_ranks,
         analyze,
         to_html,
-        to_perfetto,
+        to_memmap_html,
     )
     from schema import SchemaError, normalize
     from shim import _window_key
@@ -239,35 +239,15 @@ def run() -> int:
     if huge2 is not None and "bridge" not in huge2["label"]:
         failures.append("bridge-backed alloc label should mention bridge")
 
-    # Perfetto memory-map: x = pool offset (ts), slice width = size (dur),
-    # y = capture time as tracks. No sidecar windows here -> uniform time bands.
-    trace = to_perfetto(result)
-    te = trace.get("traceEvents", [])
-    slices = [e for e in te if e.get("ph") == "X"]
-    names = [e for e in te if e.get("ph") == "M" and e.get("name") == "process_name"]
-    if not slices:
-        failures.append("perfetto: memory-map must emit allocation slices")
-    if not names:
-        failures.append("perfetto: missing track (process_name) metadata")
-    if not all("ts" in e and "dur" in e for e in slices):
-        failures.append("perfetto: each slice needs ts (offset) and dur (size)")
-    if any(
-        e["dur"] != e["args"]["size_bytes"]
-        for e in slices
-        if e["args"]["size_bytes"] > 0
-    ):
-        failures.append("perfetto: slice dur must equal allocation size (x = memory)")
-    huge_sl = [e for e in slices if "huge_kv" in e["name"]]
-    if not huge_sl or any(e["ts"] != 0 for e in huge_sl):
-        failures.append("perfetto: huge_kv at the pool base must have ts (offset) = 0")
-    if len({e["pid"] for e in huge_sl}) < 2:
-        failures.append(
-            "perfetto: a long-lived tensor must appear on multiple time tracks (vertical reuse)"
-        )
-    if huge_sl and any(e.get("cname") == "grey" for e in huge_sl):
-        failures.append(
-            "perfetto: an S2 oversized tensor must be color-distinct (not normal)"
-        )
+    # Memory map (HTML): a 2-D rectangle per allocation; the oversized huge_kv must
+    # render as a flagged, detector-colored rectangle with a readable label.
+    mm = to_memmap_html(result)
+    if "<svg" not in mm or 'class="f"' not in mm:
+        failures.append("memmap: must render an SVG with flagged rectangles")
+    if "huge_kv" not in mm:
+        failures.append("memmap: allocation labels (huge_kv) must appear")
+    if "#d62728" not in mm:  # oversized detector color
+        failures.append("memmap: oversized allocation must be detector-colored")
 
     # AC-2: a normal report carries per-block layout for graph-pool segments.
     gp_seg = next((s for s in result["segments"] if s["is_graph_pool"]), None)
@@ -1114,8 +1094,8 @@ def run() -> int:
             "AC-6: a malformed breakable capture window must appear in omitted_windows"
         )
 
-    # Round-7 AC-9: windowed Perfetto memory-map -> a tensor live across 2 windows
-    # appears on both window tracks at the same offset (vertical reuse column).
+    # Round-7 AC-9: windowed analysis -> a tensor live across 2 capture windows is
+    # flagged as spanning both, and renders in the memory map.
     mm = []
 
     def _mma(addr, size, name):
@@ -1199,23 +1179,16 @@ def run() -> int:
             "graph_slots": [],
         },
     )
-    mmte = to_perfetto(mmres)["traceEvents"]
-    track_names = [
-        e for e in mmte if e.get("ph") == "M" and e.get("name") == "process_name"
-    ]
-    if len(track_names) != 2:
+    # A tensor live across 2 capture windows must be flagged as spanning both
+    # (non-reusable), and the windowed allocations must render in the memory map.
+    pbar = next((b for b in mmres["bars"] if "persist" in b["label"]), None)
+    if pbar is None or pbar.get("finding_spanned_capture_windows", 0) < 2:
         failures.append(
-            "AC-9: windowed memory-map must have one track per capture window"
+            "AC-9: a tensor live across 2 capture windows must be flagged spanning both"
         )
-    persist_sl = [e for e in mmte if e.get("ph") == "X" and "persist" in e["name"]]
-    if len({e["pid"] for e in persist_sl}) < 2:
-        failures.append(
-            "AC-9: a tensor live across 2 windows must appear on both window tracks"
-        )
-    if persist_sl and len({e["ts"] for e in persist_sl}) != 1:
-        failures.append(
-            "AC-9: the same tensor must sit at the same offset across tracks (vertical column)"
-        )
+    mmhtml = to_memmap_html(mmres)
+    if "<svg" not in mmhtml or "persist" not in mmhtml:
+        failures.append("AC-9: memory map must render the windowed allocations")
 
     # Round-8 AC-10: structured impact-ranked findings (pickle-only: result).
     rfind = result.get("findings") or []
@@ -1298,43 +1271,28 @@ def run() -> int:
             "AC-10: a precise weak-ref bridge must yield a bridge_event_ord non_reusable finding"
         )
 
-    # Round-8 AC-9: findings highlighted on the Perfetto memory map.
-    mmpf = to_perfetto(mmres)
-    mmpf_sl = [e for e in mmpf["traceEvents"] if e.get("ph") == "X"]
-    persist_pf = [e for e in mmpf_sl if e["args"]["addr"] == hex(GP)]
-    if not persist_pf or all(
-        "non_reusable_across_graphs" not in e["args"].get("detectors", "")
-        for e in persist_pf
+    # Round-8 AC-9: findings drive the memory-map coloring. The flagged persistent
+    # allocation carries its detector and renders in its detector color; an unflagged
+    # reuse carries no finding.
+    pb = next((b for b in mmres["bars"] if b["addr"] == GP), None)
+    if pb is None or "non_reusable_across_graphs" not in (
+        pb.get("finding_detectors") or []
     ):
         failures.append(
-            "AC-9: a flagged slice must carry its detector metadata in Perfetto"
+            "AC-9: the persistent allocation must carry a non_reusable finding"
         )
-    if persist_pf and any(e.get("cname") == "grey" for e in persist_pf):
+    t1_bar = next(
+        (b for b in mmres["bars"] if b["addr"] == GP + 8 * MiB and b["alloc_ord"] == 3),
+        None,
+    )
+    if t1_bar is not None and t1_bar.get("finding_ids"):
+        failures.append("AC-9: an unflagged reuse allocation must carry no finding")
+    if "#9467bd" not in to_memmap_html(mmres):  # non_reusable detector color
         failures.append(
-            "AC-9: a flagged slice must be color-highlighted (not normal grey)"
+            "AC-9: a non_reusable allocation must be detector-colored in the map"
         )
-    # A flagged slice must also carry spanned-window + threshold-summary args.
-    if persist_pf and any(
-        "spanned_capture_windows" not in e["args"]
-        or "finding_thresholds" not in e["args"]
-        for e in persist_pf
-    ):
-        failures.append(
-            "AC-9: a flagged slice must carry spanned-window + threshold-summary args"
-        )
-    t1_pf = [
-        e
-        for e in mmpf_sl
-        if e["args"]["addr"] == hex(GP + 8 * MiB) and e["args"]["alloc_ord"] == 3
-    ]
-    if t1_pf and any(
-        ("finding_ids" in e["args"]) or ("detectors" in e["args"]) for e in t1_pf
-    ):
-        failures.append(
-            "AC-9: an unflagged slice must NOT carry any finding metadata keys"
-        )
-    if mmpf["metadata"].get("finding_count") is None:
-        failures.append("AC-9: Perfetto metadata must include finding_count")
+    if mmres.get("finding_count") is None:
+        failures.append("AC-9: analysis must include finding_count")
 
     # Round-9 AC-10: every finding carries spanned capture/segment window counts.
     for f in rfind:
@@ -1690,13 +1648,38 @@ def run() -> int:
         failures.append(
             "AC-9: signature_counts must be finding-derived (empty when no findings)"
         )
-    ow_sl = [e for e in to_perfetto(owr)["traceEvents"] if e.get("ph") == "X"]
-    if any(e.get("cname") != "grey" for e in ow_sl):
-        failures.append(
-            "AC-9: no-finding slices must render grey (not legacy-flag colored)"
-        )
-    if any("finding_ids" in e["args"] or "detectors" in e["args"] for e in ow_sl):
-        failures.append("AC-9: no-finding slices must carry no finding metadata keys")
+    # A no-finding analysis must render no flagged (detector-colored) rectangles
+    # (class="f" marks a flagged rect; legend swatches use a different class).
+    if 'class="f"' in to_memmap_html(owr):
+        failures.append("AC-9: a no-finding memory map must have no flagged rectangles")
+
+    # History-ring truncation must FAIL LOUD: a device trace at the configured
+    # max_entries means torch evicted the oldest events (early windows render
+    # empty; later attribution may be shifted). Detected from sidecar max_entries
+    # x per-device trace lengths; surfaced in the result and as a memmap banner +
+    # hatched band. A non-saturated capture must NOT carry the warning.
+    if owr.get("history_truncation") is not None:
+        failures.append("truncation: non-saturated capture must not warn")
+    trunc_res = analyze(
+        normalize(ow_raw),
+        sidecar={
+            "schema_version": 1,
+            "runner": "standard",
+            "max_entries": 4,  # == len(device trace) -> saturated ring
+            "bridges": [],
+            "segment_windows": [],
+            "graph_slots": [],
+            "capture_windows": [_std_win(1, 0, 4, "w")],
+        },
+    )
+    ht = trunc_res.get("history_truncation")
+    if not ht or ht.get("max_entries") != 4:
+        failures.append("truncation: saturated ring must set history_truncation")
+    trunc_mm = to_memmap_html(trunc_res)
+    if "history ring overflowed" not in trunc_mm or 'class="evic"' not in trunc_mm:
+        failures.append("truncation: memmap must show the overflow banner + band")
+    if "history ring overflowed" in to_memmap_html(owr):
+        failures.append("truncation: non-saturated memmap must not show the banner")
 
     # Round-11 AC-9: per-window report signature_counts is finding-derived, not legacy
     # flags. The one-window ordinary report must have empty signature_counts while
@@ -1735,104 +1718,6 @@ def run() -> int:
         failures.append(
             "AC-9: cross_graph_signature must report the segment-kind count"
         )
-
-    # Round-10 AC-9: a flagged allocation is colored by its strongest detector.
-    seg_pf = [
-        e
-        for e in to_perfetto(sres)["traceEvents"]
-        if e.get("ph") == "X" and e["args"]["addr"] == hex(GP)
-    ]
-    if not seg_pf or any(e.get("cname") == "grey" for e in seg_pf):
-        failures.append(
-            "AC-9: a flagged allocation must be color-highlighted by its detector (not grey)"
-        )
-
-    # Round-13 AC-9: complete slices must not overlap on one Perfetto track — render
-    # only the peak-live (address-disjoint) set, so address reuse within a window
-    # (A freed, B reallocated at the same offset) does not emit two slices at the
-    # same offset (which Perfetto drops as overlapping).
-    ru = []
-
-    def _rua(addr, size, name):
-        ru.append(
-            {
-                "action": "alloc",
-                "addr": addr,
-                "size": size,
-                "time_us": len(ru) * 10,
-                "frames": _frame(name),
-            }
-        )
-
-    def _ruf(addr):
-        ru.append(
-            {
-                "action": "free_requested",
-                "addr": addr,
-                "size": 0,
-                "time_us": len(ru) * 10,
-                "frames": [],
-            }
-        )
-
-    _rua(GP, 8 * MiB, "A")  # ord0
-    _ruf(GP)  # ord1
-    _rua(GP, 8 * MiB, "B")  # ord2 reuse the same offset
-    _ruf(GP)  # ord3
-    _rua(GP + 16 * MiB, 1 * MiB, "C")  # ord4 distinct offset, live with nothing else
-    ru_raw = {
-        "segments": [
-            {
-                "address": GP,
-                "total_size": 64 * MiB,
-                "stream": 1,
-                "segment_pool_id": (0, 1),
-                "segment_type": "large",
-                "blocks": [
-                    {
-                        "address": GP,
-                        "size": 8 * MiB,
-                        "requested_size": 8 * MiB,
-                        "state": "inactive",
-                        "frames": [],
-                    }
-                ],
-            }
-        ],
-        "device_traces": [ru],
-        "allocator_settings": {},
-        "external_annotations": [],
-    }
-    rures = analyze(
-        normalize(ru_raw),
-        sidecar={
-            "schema_version": 1,
-            "runner": "standard",
-            "bridges": [],
-            "segment_windows": [],
-            "graph_slots": [],
-            "capture_windows": [_std_win(1, 0, 5, "w")],
-        },
-    )
-
-    def _overlaps(events):
-        per_pid = {}
-        for e in events:
-            if e.get("ph") == "X":
-                per_pid.setdefault(e["pid"], []).append((e["ts"], e["ts"] + e["dur"]))
-        for ivs in per_pid.values():
-            ivs.sort()
-            for (s1, e1), (s2, e2) in zip(ivs, ivs[1:]):
-                if s2 < e1:  # partial overlap (touching s2 == e1 is allowed)
-                    return True
-        return False
-
-    for _name, _res in (("reuse", rures), ("windowed", mmres), ("bands", result)):
-        if _overlaps(to_perfetto(_res)["traceEvents"]):
-            failures.append(
-                f"AC-9: Perfetto must not emit overlapping complete slices on one "
-                f"track ({_name})"
-            )
 
     # Round-6 AC-5 (shim): a static buffer is recorded once PER window (not just the
     # first), deduped by (window_key, storage_ptr). Torch-guarded (no GPU needed).
