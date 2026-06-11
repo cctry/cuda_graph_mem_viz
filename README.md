@@ -1,4 +1,4 @@
-# cg_mem_inspect — CUDA-graph pool memory inspector
+# CUDA-graph pool memory inspector
 
 Records, analyzes, and visualizes SGLang's shared CUDA-graph memory pool as a
 self-contained **time × address memory map** (`*.memmap.html`) — y-axis = capture
@@ -13,24 +13,16 @@ capture is a runtime monkey-patch shim.
 
 ```bash
 # 1. Launch — capture a snapshot during CUDA-graph warmup (wraps launch_server):
-uv run --no-sync \
-    python cg_mem_inspect/launch.py <launch_server args> --enable-breakable-cuda-graph
+python cg_mem_inspect/launch.py <launch_server args> --enable-breakable-cuda-graph
 
 # 2. Generate HTML — turn the snapshot into the memory map, then open it:
-uv run --no-sync python cg_mem_inspect/analyzer.py \
+python cg_mem_inspect/analyzer.py \
     cg_mem_artifacts/cgmem_..._breakable.pickle
-#   → cg_mem_artifacts/cgmem_..._breakable.memmap.html
+# generate cg_mem_artifacts/cgmem_..._breakable.memmap.html
 ```
 
 Details for each step below.
 
-## Prereqs
-- A GPU + a `prod_inference` checkout's uv env (`torch 2.11`, sglang importable).
-  This repo is pure tooling with no env of its own: clone it anywhere and run the
-  commands below from inside the `prod_inference` tree (adjusting the
-  `cg_mem_inspect/` paths to where you cloned), or activate that venv first.
-  Prefix commands with `LD_PRELOAD=/usr/lib64/libnuma.so.1` (needed to import
-  sglang on devservers).
 
 ## 1. Launch (capture a snapshot)
 
@@ -43,10 +35,8 @@ location with `CG_MEM_INSPECT_OUTDIR=/some/dir`. `launch.py` injects
 real checkpoint, so startup is far faster); pass your own `--load-format` to override.
 
 ```bash
-LD_PRELOAD=/usr/lib64/libnuma.so.1 \
-uv run --no-sync python cg_mem_inspect/launch.py \
+python cg_mem_inspect/launch.py \
     --model-path /data/users/$USER/models/tier1 \
-    --served-model-name llama4x --host :: \
     --enable-breakable-cuda-graph \
     --cuda-graph-bs 1 2 4          # keep capture fast; optional
 ```
@@ -81,7 +71,7 @@ window→event attribution after the horizon may be shifted. Re-capture with a l
 ## 2. Generate the HTML memory map
 
 ```bash
-uv run --no-sync python cg_mem_inspect/analyzer.py \
+python cg_mem_inspect/analyzer.py \
     cg_mem_artifacts/cgmem_..._breakable.pickle
 ```
 
@@ -174,16 +164,16 @@ analyzer from the manifest instead of a single pickle:
 
 ```bash
 # Analyze rank 0 (default) or a specific rank — never merges ranks.
-uv run --no-sync python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/
-uv run --no-sync python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/ --rank 1
+python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/
+python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/ --rank 1
 
 # Cross-rank comparison: per-variant high-water / reserved / peak + deltas from rank 0.
-uv run --no-sync python cg_mem_inspect/analyzer.py \
+python cg_mem_inspect/analyzer.py \
     --artifact-dir cg_mem_artifacts/ --compare-ranks            # -> cross_rank_comparison.json
 
 # Regression baseline (per-variant high-water marks): save once, gate later runs.
-uv run --no-sync python ... --artifact-dir cg_mem_artifacts/ --compare-ranks --save-baseline base.json
-uv run --no-sync python ... --artifact-dir cg_mem_artifacts/ --compare-ranks \
+python ... --artifact-dir cg_mem_artifacts/ --compare-ranks --save-baseline base.json
+python ... --artifact-dir cg_mem_artifacts/ --compare-ranks \
     --load-baseline base.json --baseline-regression-threshold-fraction 0.05
 ```
 
