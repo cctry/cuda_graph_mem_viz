@@ -13,7 +13,7 @@ Capture-window boundaries (from the runtime shim) sharpen the cross-graph
 signature when available; without them it is reported as an approximation.
 
 Run:
-    uv run python personal/shiyang/cg_mem_inspect/analyzer.py <snapshot.pickle> \
+    uv run python cg_mem_inspect/analyzer.py <snapshot.pickle> \
         --out-dir <dir> [--include-default-pool]
 """
 

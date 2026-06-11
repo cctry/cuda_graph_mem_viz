@@ -5,7 +5,7 @@ This is just a convenience for viewing them on a remote (IPv6-only) devserver
 without copying: it serves the artifacts directory and prints a link per memory
 map. Forward the port from your laptop, then open a printed link:
 
-    uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py [--port 8099]
+    uv run --no-sync python cg_mem_inspect/serve.py [--port 8099]
     ssh -L 8099:localhost:8099 <devserver>
 """
 

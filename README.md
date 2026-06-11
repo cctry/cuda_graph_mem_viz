@@ -14,10 +14,10 @@ capture is a runtime monkey-patch shim.
 ```bash
 # 1. Launch — capture a snapshot during CUDA-graph warmup (wraps launch_server):
 uv run --no-sync \
-    python personal/shiyang/cg_mem_inspect/launch.py <launch_server args> --enable-breakable-cuda-graph
+    python cg_mem_inspect/launch.py <launch_server args> --enable-breakable-cuda-graph
 
 # 2. Generate HTML — turn the snapshot into the memory map, then open it:
-uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
+uv run --no-sync python cg_mem_inspect/analyzer.py \
     cg_mem_artifacts/cgmem_..._breakable.pickle
 #   → cg_mem_artifacts/cgmem_..._breakable.memmap.html
 ```
@@ -25,8 +25,12 @@ uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
 Details for each step below.
 
 ## Prereqs
-- A GPU + the project uv env (`torch 2.11`). Prefix commands with
-  `LD_PRELOAD=/usr/lib64/libnuma.so.1` (needed to import sglang on devservers).
+- A GPU + a `prod_inference` checkout's uv env (`torch 2.11`, sglang importable).
+  This repo is pure tooling with no env of its own: clone it anywhere and run the
+  commands below from inside the `prod_inference` tree (adjusting the
+  `cg_mem_inspect/` paths to where you cloned), or activate that venv first.
+  Prefix commands with `LD_PRELOAD=/usr/lib64/libnuma.so.1` (needed to import
+  sglang on devservers).
 
 ## 1. Launch (capture a snapshot)
 
@@ -40,7 +44,7 @@ real checkpoint, so startup is far faster); pass your own `--load-format` to ove
 
 ```bash
 LD_PRELOAD=/usr/lib64/libnuma.so.1 \
-uv run --no-sync python personal/shiyang/cg_mem_inspect/launch.py \
+uv run --no-sync python cg_mem_inspect/launch.py \
     --model-path /data/users/$USER/models/tier1 \
     --served-model-name llama4x --host :: \
     --enable-breakable-cuda-graph \
@@ -71,13 +75,13 @@ empty first bucket like `nt=16384` is THIS, not "no allocations"), and
 window→event attribution after the horizon may be shifted. Re-capture with a larger
 `CG_MEM_INSPECT_MAX_ENTRIES` or fewer shapes for a trustworthy map.
 
-**Sanity / feasibility check (no model):** `uv run --no-sync python personal/shiyang/cg_mem_inspect/validator.py`
+**Sanity / feasibility check (no model):** `uv run --no-sync python cg_mem_inspect/validator.py`
 — proves the torch snapshot exposes what's needed and writes `cg_mem_artifacts/capability_manifest.json`.
 
 ## 2. Generate the HTML memory map
 
 ```bash
-uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
+uv run --no-sync python cg_mem_inspect/analyzer.py \
     cg_mem_artifacts/cgmem_..._breakable.pickle
 ```
 
@@ -135,7 +139,7 @@ runs a tiny IPv6 HTTP server over the artifacts dir and prints a link per map (t
 cluster is IPv6-only, which `python -m http.server` can't bind):
 
 ```bash
-uv run --no-sync python personal/shiyang/cg_mem_inspect/serve.py   # serves ./cg_mem_artifacts on :8099
+uv run --no-sync python cg_mem_inspect/serve.py   # serves ./cg_mem_artifacts on :8099
 ssh -L 8099:localhost:8099 <devserver>                             # then open the printed link
 ```
 
@@ -170,11 +174,11 @@ analyzer from the manifest instead of a single pickle:
 
 ```bash
 # Analyze rank 0 (default) or a specific rank — never merges ranks.
-uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/
-uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/ --rank 1
+uv run --no-sync python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/
+uv run --no-sync python cg_mem_inspect/analyzer.py --artifact-dir cg_mem_artifacts/ --rank 1
 
 # Cross-rank comparison: per-variant high-water / reserved / peak + deltas from rank 0.
-uv run --no-sync python personal/shiyang/cg_mem_inspect/analyzer.py \
+uv run --no-sync python cg_mem_inspect/analyzer.py \
     --artifact-dir cg_mem_artifacts/ --compare-ranks            # -> cross_rank_comparison.json
 
 # Regression baseline (per-variant high-water marks): save once, gate later runs.
@@ -205,4 +209,4 @@ Labels come from the allocating call-site frame (e.g. `forward_cuda_c (fused_nor
 - Feature availability is gated by `capability_manifest` ∩ the analyzed snapshot;
   missing fields fail closed (no fabricated layout/lifetime) or degrade with a note.
 - `cg_mem_artifacts/` is git-ignored (snapshots are large).
-- Run the self-test (no GPU needed): `uv run --no-sync python -m personal.shiyang.cg_mem_inspect.selftest`.
+- Run the self-test (no GPU needed): `uv run --no-sync python -m cg_mem_inspect.selftest`.

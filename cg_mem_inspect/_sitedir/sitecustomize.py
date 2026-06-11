@@ -18,7 +18,7 @@ if os.environ.get("CG_MEM_INSPECT", "") not in ("", "0", "false", "False", "no")
     if repo and repo not in sys.path:
         sys.path.insert(0, repo)
     try:
-        from personal.shiyang.cg_mem_inspect.shim import install
+        from cg_mem_inspect.shim import install
 
         install()
     except Exception as e:  # pragma: no cover

@@ -5,7 +5,7 @@ is inherited by SGLang's spawned scheduler workers and survives _maybe_reexec).
 
 Usage (all args after this script are passed straight through to launch_server):
 
-    uv run --no-sync python personal/shiyang/cg_mem_inspect/launch.py \\
+    uv run --no-sync python cg_mem_inspect/launch.py \\
         --model-path /data/users/$USER/models/tier1 \\
         --served-model-name llama4x --host :: \\
         --enable-breakable-cuda-graph
@@ -23,7 +23,7 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
+_REPO = os.path.dirname(_HERE)
 _SITEDIR = os.path.join(_HERE, "_sitedir")
 
 

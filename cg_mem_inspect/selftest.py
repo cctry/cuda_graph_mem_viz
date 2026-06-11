@@ -6,7 +6,7 @@ lifetime extraction, and signature flagging behave correctly. Also asserts the
 normalizer fails closed on a malformed snapshot.
 
 Run:
-    uv run python -m personal.shiyang.cg_mem_inspect.selftest
+    uv run python -m cg_mem_inspect.selftest
 """
 
 from __future__ import annotations

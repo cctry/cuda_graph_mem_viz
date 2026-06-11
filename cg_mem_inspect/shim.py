@@ -1,6 +1,6 @@
 """Runtime monkey-patch shim for capturing CUDA-graph memory snapshots.
 
-Lives entirely in personal/shiyang/ and edits NO file under sglang/ or
+Lives entirely in this repo and edits NO file under sglang/ or
 sglang_meta/. It is applied in-process (by a sitecustomize on PYTHONPATH, so it
 also reaches SGLang's spawned scheduler workers) and, around CUDA-graph capture,
 records the allocator state plus a structured sidecar so the offline analyzer can

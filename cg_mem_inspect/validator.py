@@ -12,7 +12,7 @@ known capture-time allocations are actually located in the snapshot — if they
 are not, the whole snapshot-based approach is unsound and the tool says so.
 
 Run:
-    uv run python personal/shiyang/cg_mem_inspect/validator.py
+    uv run python cg_mem_inspect/validator.py
 """
 
 from __future__ import annotations
