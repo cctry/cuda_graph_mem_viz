@@ -1840,10 +1840,12 @@ def to_memmap_html(
         color = _bar_color(b)
         if b.get("finding_ids") and b.get("finding_impact", 0) < strong_impact:
             color = _tint_hex(color)
+        # data-d feeds the instant JS tooltip only — no <title> child, or the
+        # browser's delayed native tooltip would pop a second copy on hover.
         rects.append(
             f'<rect class="{cls}" x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" '
-            f'height="{h:.2f}" fill="{color}" data-d="{html.escape(info, quote=True)}">'
-            f"<title>{html.escape(info)}</title></rect>"
+            f'height="{h:.2f}" fill="{color}" '
+            f'data-d="{html.escape(info, quote=True)}"/>'
         )
         # On-block text = call-site location + size. The loc is the (file:line) inside
         # the frame label, e.g. "fused_norm_residual.py:371".
