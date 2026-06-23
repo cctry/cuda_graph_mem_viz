@@ -1,7 +1,7 @@
 """Runtime monkey-patch shim for capturing CUDA-graph memory snapshots.
 
-Lives entirely in this repo and edits NO file under sglang/ or
-sglang_meta/. It is applied in-process (by a sitecustomize on PYTHONPATH, so it
+Lives entirely in this repo and edits NO file under sglang/. It is applied
+in-process (by a sitecustomize on PYTHONPATH, so it
 also reaches SGLang's spawned scheduler workers) and, around CUDA-graph capture,
 records the allocator state plus a structured sidecar so the offline analyzer can
 attribute allocations to capture windows, segments, named buffers, and weak-ref
@@ -193,6 +193,16 @@ def _trace_len() -> int:
 
 
 def _pool_handle():
+    # Refactored API (PR #23906): the shared graph pool lives in runner_utils.pool.
+    try:
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_global_graph_memory_pool,
+        )
+
+        return str(get_global_graph_memory_pool())
+    except Exception:
+        pass
+    # Legacy pre-refactor location (older sglang).
     try:
         from sglang.srt.model_executor.cuda_graph_runner import (
             get_global_graph_memory_pool,
@@ -393,17 +403,37 @@ def _dump(runner: str) -> None:
 # --------------------------------------------------------------------------- #
 # Wrappers
 # --------------------------------------------------------------------------- #
-def _wrap_outer_capture(orig, runner_name: str):
+# Map refactored runner class names to short, stable tags. A None runner_name
+# passed to the wrappers means "derive from the instance class" — this keeps
+# EAGLE/spec runners (which subclass DecodeCudaGraphRunner) tagged distinctly
+# even though they inherit the wrapped methods.
+_RUNNER_TAGS = {
+    "DecodeCudaGraphRunner": "decode",
+    "PrefillCudaGraphRunner": "prefill",
+    "EAGLEDraftCudaGraphRunner": "eagle_draft",
+    "EAGLEDraftExtendCudaGraphRunner": "eagle_draft_extend",
+    "MultiLayerEagleDraftExtendCudaGraphRunner": "eagle_ml_draft_extend",
+    "FrozenKVMTPCudaGraphRunner": "frozen_kv_mtp",
+}
+
+
+def _runner_tag(obj) -> str:
+    n = type(obj).__name__
+    return _RUNNER_TAGS.get(n, n)
+
+
+def _wrap_outer_capture(orig, runner_name=None):
     def capture(self, *args, **kwargs):
         if not enabled():
             return orig(self, *args, **kwargs)
+        name = runner_name or _runner_tag(self)
         _reset_accumulators()
         _start_recording()
         try:
             return orig(self, *args, **kwargs)
         finally:
             try:
-                _dump(runner_name)
+                _dump(name)
             finally:
                 _stop_recording()
 
@@ -411,17 +441,24 @@ def _wrap_outer_capture(orig, runner_name: str):
     return capture
 
 
-def _wrap_per_shape(orig, runner_name: str, axis: str):
-    """Wrap a per-shape capture method, recording its begin/end event ordinals."""
+def _wrap_per_shape(orig, runner_name, axis: str):
+    """Wrap a per-shape capture method, recording its begin/end event ordinals.
+
+    ``runner_name=None`` -> derive the tag from the instance class."""
 
     def capture_one(self, *args, **kwargs):
         if not enabled():
             return orig(self, *args, **kwargs)
-        value = _as_int(args[0]) if args else _as_int(kwargs.get(axis))
+        runner = runner_name or _runner_tag(self)
+        value = (
+            _as_int(args[0])
+            if args
+            else _as_int(kwargs.get("size", kwargs.get(axis)))
+        )
         stream_idx = _as_int(kwargs.get("stream_idx"))
         if stream_idx is None and len(args) >= 3:
             stream_idx = _as_int(args[2])
-        wkey = _window_key(runner_name, axis, value, stream_idx=stream_idx)
+        wkey = _window_key(runner, axis, value, stream_idx=stream_idx)
         wkey_reset = _cur_window_key.set(wkey)
         token_reset = _cur_num_tokens.set(value) if axis == "num_tokens" else None
         _extract_graph_slots(self)
@@ -431,7 +468,7 @@ def _wrap_per_shape(orig, runner_name: str, axis: str):
         finally:
             _capture_windows.append(
                 {
-                    "runner": runner_name,
+                    "runner": runner,
                     "axis": axis,
                     "value": value,
                     "stream_idx": stream_idx,
@@ -557,63 +594,41 @@ def _wrap_method(cls, name, factory, *factory_args) -> None:
         setattr(cls, name, factory(cur, *factory_args))
 
 
-def _patch_cuda_graph_runner(module) -> None:
-    cls = getattr(module, "CudaGraphRunner", None)
+# Refactored runner API (PR #23906): the per-phase runners live under
+# ``model_executor/runner/`` and expose ``capture()`` (outer loop) plus
+# ``capture_one_shape(size, ...)`` (one graph per shape). The actual graph
+# recording happens in the pluggable backend's ``capture_one``, but wrapping at
+# the runner level keeps the runner identity (decode vs prefill vs spec) and the
+# shape axis available, matching the old per-shape window semantics.
+def _patch_decode_runner(module) -> None:
+    cls = getattr(module, "DecodeCudaGraphRunner", None)
     if cls is None:
         return
-    _wrap_method(cls, "capture", _wrap_outer_capture, "standard")
-    _wrap_method(cls, "capture_one_batch_size", _wrap_per_shape, "standard", "bs")
+    # runner_name=None -> tag derived from the instance (so EAGLE/spec subclasses
+    # that inherit these methods are still labelled distinctly).
+    _wrap_method(cls, "capture", _wrap_outer_capture, None)
+    _wrap_method(cls, "capture_one_shape", _wrap_per_shape, None, "bs")
 
 
-def _patch_breakable_runner(module) -> None:
-    cls = getattr(module, "BreakableCudaGraphRunner", None)
+def _patch_prefill_runner(module) -> None:
+    cls = getattr(module, "PrefillCudaGraphRunner", None)
     if cls is None:
         return
-    # Outer capture: prefer _capture_all, else capture.
-    for outer in ("_capture_all", "capture"):
-        if getattr(cls, outer, None) is not None:
-            _wrap_method(cls, outer, _wrap_outer_capture, "breakable")
-            break
-    _wrap_method(cls, "_capture_one", _wrap_per_shape, "breakable", "num_tokens")
+    _wrap_method(cls, "capture", _wrap_outer_capture, None)
+    _wrap_method(cls, "capture_one_shape", _wrap_per_shape, None, "num_tokens")
 
 
-def _patch_piecewise_runner(module) -> None:
-    cls = getattr(module, "PiecewiseCudaGraphRunner", None)
-    if cls is None:
-        return
-    for outer in ("capture", "_capture_all"):
-        if getattr(cls, outer, None) is not None:
-            _wrap_method(cls, outer, _wrap_outer_capture, "piecewise")
-            break
-    _wrap_method(
-        cls, "capture_one_batch_size", _wrap_per_shape, "piecewise", "num_tokens"
-    )
-
-
-def _patch_eagle_runner(module, cls_name: str, runner_name: str) -> None:
-    """EAGLE/speculative draft runners share the target's per-batch-size capture
-    interface (``capture`` + ``capture_one_batch_size(bs, forward, stream_idx)``) and
-    the SAME global graph memory pool, so they are wrapped exactly like ``standard``
-    — just tagged with their own runner name so the dump/sidecar are distinct."""
-    cls = getattr(module, cls_name, None)
-    if cls is None:
-        return
-    _wrap_method(cls, "capture", _wrap_outer_capture, runner_name)
-    _wrap_method(cls, "capture_one_batch_size", _wrap_per_shape, runner_name, "bs")
-
-
-def _patch_eagle_draft_runner(module) -> None:
-    _patch_eagle_runner(module, "EAGLEDraftCudaGraphRunner", "eagle_draft")
-
-
-def _patch_eagle_draft_extend_runner(module) -> None:
-    _patch_eagle_runner(module, "EAGLEDraftExtendCudaGraphRunner", "eagle_draft_extend")
-
-
-def _patch_multilayer_eagle_draft_extend_runner(module) -> None:
-    _patch_eagle_runner(
-        module, "MultiLayerEagleDraftExtendCudaGraphRunner", "eagle_ml_draft_extend"
-    )
+def _patch_spec_runner(module) -> None:
+    """Best-effort coverage for speculative-decoding runners. They subclass the
+    refactored Decode/Prefill runners, so they usually inherit already-wrapped
+    methods (the ``_cgmem`` guard then skips them). This only bites when a spec
+    runner *overrides* ``capture`` / ``capture_one_shape`` with its own method."""
+    for name, cls in list(vars(module).items()):
+        if not isinstance(cls, type) or not name.endswith("CudaGraphRunner"):
+            continue
+        axis = "num_tokens" if "Extend" in name or "Prefill" in name else "bs"
+        _wrap_method(cls, "capture", _wrap_outer_capture, None)
+        _wrap_method(cls, "capture_one_shape", _wrap_per_shape, None, axis)
 
 
 def _patch_breakable_module(module) -> None:
@@ -673,14 +688,16 @@ def install() -> None:
             return
         _TARGETS.update(
             {
-                "sglang.srt.model_executor.cuda_graph_runner": _patch_cuda_graph_runner,
-                "sglang.srt.model_executor.breakable_cuda_graph_runner": _patch_breakable_runner,
-                "sglang.srt.model_executor.piecewise_cuda_graph_runner": _patch_piecewise_runner,
-                "sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph": _patch_breakable_module,
-                # EAGLE / speculative-decoding draft graphs (share the global graph pool).
-                "sglang.srt.speculative.eagle_draft_cuda_graph_runner": _patch_eagle_draft_runner,
-                "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner": _patch_eagle_draft_extend_runner,
-                "sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner": _patch_multilayer_eagle_draft_extend_runner,
+                # Refactored per-phase runners (PR #23906).
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner": _patch_decode_runner,
+                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner": _patch_prefill_runner,
+                # Breakable segmented-capture internals (weak-ref bridges + segments).
+                "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph": _patch_breakable_module,
+                # EAGLE / speculative-decoding runners (subclass Decode/Prefill, share the global pool).
+                "sglang.srt.speculative.eagle_draft_cuda_graph_runner": _patch_spec_runner,
+                "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner": _patch_spec_runner,
+                "sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner": _patch_spec_runner,
+                "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner": _patch_spec_runner,
             }
         )
         for name, fn in _TARGETS.items():

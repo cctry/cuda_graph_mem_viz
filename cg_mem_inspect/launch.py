@@ -1,5 +1,5 @@
 """Launch wrapper that enables the CUDA-graph memory shim, then execs the normal
-SGLang server. No edits to sglang/ or sglang_meta/ are made — instrumentation is
+SGLang server. No edits to sglang/ are made — instrumentation is
 purely a runtime monkey-patch installed via a sitecustomize on PYTHONPATH (which
 is inherited by SGLang's spawned scheduler workers and survives _maybe_reexec).
 
@@ -46,7 +46,7 @@ def main() -> None:
         a == "--load-format" or a.startswith("--load-format=") for a in passthrough
     ):
         passthrough += ["--load-format", "dummy"]
-    cmd = [sys.executable, "-m", "sglang_meta.launch_server"] + passthrough
+    cmd = [sys.executable, "-m", "sglang.launch_server"] + passthrough
     print(
         f"[cg_mem_inspect] launching with shim; outdir={env['CG_MEM_INSPECT_OUTDIR']}",
         file=sys.stderr,

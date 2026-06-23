@@ -6,7 +6,7 @@ order (one rectangle per allocation, height = its lifetime), x-axis = packed poo
 offset (rectangle width = its size). Reading down a memory column shows how a region
 is reused (or held) across captures over time; reading across shows how large a
 tensor is. The three inefficiency signatures are colored, and the worst offenders are
-surfaced as a ranked `findings[]` list. No edits to `sglang/` or `sglang_meta/` —
+surfaced as a ranked `findings[]` list. No edits to `sglang/` —
 capture is a runtime monkey-patch shim.
 
 ## Two steps
