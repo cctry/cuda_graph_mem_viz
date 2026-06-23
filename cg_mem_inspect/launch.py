@@ -46,9 +46,14 @@ def main() -> None:
         a == "--load-format" or a.startswith("--load-format=") for a in passthrough
     ):
         passthrough += ["--load-format", "dummy"]
-    cmd = [sys.executable, "-m", "sglang.launch_server"] + passthrough
+    # Server entrypoint module. Public default is OSS ``sglang``; set
+    # CG_MEM_INSPECT_ENTRYPOINT=sglang_meta.launch_server to drive an internal
+    # build instead. Anything importable as ``-m <module>`` works.
+    entrypoint = env.get("CG_MEM_INSPECT_ENTRYPOINT", "sglang.launch_server")
+    cmd = [sys.executable, "-m", entrypoint] + passthrough
     print(
-        f"[cg_mem_inspect] launching with shim; outdir={env['CG_MEM_INSPECT_OUTDIR']}",
+        f"[cg_mem_inspect] launching {entrypoint} with shim; "
+        f"outdir={env['CG_MEM_INSPECT_OUTDIR']}",
         file=sys.stderr,
     )
     os.execvpe(sys.executable, cmd, env)
