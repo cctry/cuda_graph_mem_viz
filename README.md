@@ -35,6 +35,7 @@ location with `CG_MEM_INSPECT_OUTDIR=/some/dir`. `launch.py` injects
 real checkpoint, so startup is far faster); pass your own `--load-format` to override.
 
 ```bash
+CG_MEM_INSPECT_ENTRYPOINT=sglang.launch_server
 python cg_mem_inspect/launch.py \
     --model-path /data/users/$USER/models/tier1 \
     --enable-breakable-cuda-graph \
